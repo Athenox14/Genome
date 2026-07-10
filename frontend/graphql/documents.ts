@@ -3,10 +3,10 @@
  * schema in crates/graphql-api/src/{query,mutation,types}.rs.
  *
  * Notes on schema shape:
- * - RepositoryObject does NOT expose an `owner` login string (owner_login is
- *   `#[graphql(skip)]`). Only `ownerType` + `ownerId` are available. Callers
- *   that need a slug (e.g. `/{owner}/{repo}` links) must derive it from the
- *   current user (for own repos) or a separate `organization`/`user` lookup.
+ * - RepositoryObject exposes `ownerLogin` (username or org name), resolved
+ *   dynamically from the polymorphic `ownerType`/`ownerId` pair. Use it to
+ *   build `/{ownerLogin}/{name}` links instead of falling back to raw
+ *   `ownerId` UUIDs.
  * - Issues/PullRequests/WorkflowRuns/Branches/Tree/Commits are only
  *   reachable as nested fields on `repository(owner, name)`, not as root
  *   query fields.
@@ -27,6 +27,7 @@ export const MY_REPOSITORIES_QUERY = /* GraphQL */ `
       id
       ownerType
       ownerId
+      ownerLogin
       name
       description
       isPrivate
@@ -42,6 +43,7 @@ export const CREATE_REPOSITORY_MUTATION = /* GraphQL */ `
       id
       ownerType
       ownerId
+      ownerLogin
       name
     }
   }
@@ -53,6 +55,7 @@ export const REPO_OVERVIEW_QUERY = /* GraphQL */ `
       id
       ownerType
       ownerId
+      ownerLogin
       name
       description
       defaultBranch

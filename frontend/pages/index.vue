@@ -5,6 +5,7 @@ interface Repository {
   id: string
   ownerType: string
   ownerId: string
+  ownerLogin: string
   name: string
   description: string | null
   isPrivate: boolean
@@ -13,17 +14,11 @@ interface Repository {
 }
 
 const { $urql } = useNuxtApp()
-const authStore = useAuthStore()
 
-// RepositoryObject does not expose an owner login (it's `#[graphql(skip)]`
-// on the backend). For repos owned directly by the current user we can use
-// their username; for org-owned or collaborator repos there is currently no
-// way to resolve the login from this query alone.
+// RepositoryObject exposes `ownerLogin` (username or org name), resolved
+// server-side from the polymorphic ownerType/ownerId pair.
 function ownerSlug(repo: Repository): string {
-  if (repo.ownerType === 'user' && repo.ownerId === authStore.user?.id) {
-    return authStore.user?.username || repo.ownerId
-  }
-  return repo.ownerId
+  return repo.ownerLogin || repo.ownerId
 }
 
 const repos = ref<Repository[]>([])

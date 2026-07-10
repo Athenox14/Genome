@@ -91,6 +91,22 @@ pub async fn resolve_owner_login(
 
 #[ComplexObject]
 impl RepositoryObject {
+    /// Login (username or org name) of the repository owner, resolved
+    /// dynamically via the polymorphic owner_type/owner_id pair. Exposed
+    /// so clients can build clean `/owner/repo` URLs instead of falling
+    /// back to raw owner UUIDs.
+    async fn owner_login(&self, ctx: &Context<'_>) -> async_graphql::Result<String> {
+        let app = ctx.data::<AppContext>()?;
+        resolve_owner_login(&app.db, &self.owner_type, self.owner_id)
+            .await
+            .ok_or_else(|| {
+                async_graphql::Error::new(format!(
+                    "dangling owner reference: repository {} has owner_type={:?} owner_id={} with no matching record",
+                    self.id, self.owner_type, self.owner_id
+                ))
+            })
+    }
+
     async fn issues(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<IssueObject>> {
         let app = ctx.data::<AppContext>()?;
         let issues = entity::prelude::Issue::find()
