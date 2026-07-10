@@ -45,3 +45,12 @@ aes-gcm = "0.10"
 base64 = "0.22"
 rand = "0.8"
 reqwest = { version = "0.12", features = ["json"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# NOTE: intentionally NOT panic = "abort" -- axum relies on catching a panic
+# per-request (unwinding) so a bug in one handler doesn't take down the
+# whole server process; abort would remove that safety net.
