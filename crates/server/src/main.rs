@@ -223,6 +223,11 @@ async fn main() -> anyhow::Result<()> {
             "/artifacts/:id/download",
             get(download_artifact_handler),
         )
+        .route("/runner/claim", post(runner_claim_handler))
+        .route(
+            "/runner/jobs/:id/complete",
+            post(runner_complete_handler),
+        )
         .layer(GovernorLayer {
             config: governor_conf,
         })
@@ -552,6 +557,40 @@ async fn process_push_workflows(
 
             for (_job_id, job) in workflow.jobs.iter() {
                 let env_extra = HashMap::new();
+
+                // Record this job in `runner_jobs` for history/observability,
+                // but with status `HANDLED_INPROCESS` (not `QUEUED`) since
+                // it's about to run right here -- `/runner/claim` only ever
+                // selects `QUEUED` rows, so a standalone runner can never
+                // pick this one up and double-execute it.
+                let runner_job_payload = serde_json::json!({
+                    "run_id": run_model.id,
+                    "job": job,
+                    "repo_archive_b64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &archive),
+                    "env_extra": env_extra,
+                    "secrets": secrets,
+                })
+                .to_string();
+                let runner_job_res = app_ctx
+                    .db
+                    .execute(
+                        "INSERT INTO runner_jobs (id, kind, repo_id, workflow_run_id, payload, status, claimed_by, claimed_at, created_at, finished_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, NULL)",
+                        params!(
+                            Uuid::new_v4().to_string(),
+                            entity::runner_job::kind::CI_JOB.to_string(),
+                            Some(repo_row.id.to_string()),
+                            Some(run_model.id.to_string()),
+                            runner_job_payload,
+                            entity::runner_job::status::HANDLED_INPROCESS.to_string(),
+                            chrono::Utc::now().to_rfc3339()
+                        ),
+                    )
+                    .await;
+                if let Err(e) = runner_job_res {
+                    tracing::warn!("failed to record runner_job history row (non-fatal): {e}");
+                }
+
                 let executor = app_ctx.actions_executor.clone();
                 let job = job.clone();
                 let archive = archive.clone();
@@ -771,6 +810,170 @@ async fn run_check_push_protection(args: &[String]) -> anyhow::Result<i32> {
     }
 
     Ok(if rejected { 1 } else { 0 })
+}
+
+// ---------------------------------------------------------------------
+// Standalone runner (crates/runner) polling routes
+// ---------------------------------------------------------------------
+
+/// `POST /runner/claim` -- called by a standalone `runner` binary. Auth uses
+/// the same bearer-token/PAT validation as every other authenticated route
+/// (`auth::extract_user_from_headers` + `DbTokenLookup` against
+/// `access_tokens`); any valid, non-expired token may claim jobs.
+///
+/// Hiqlite (rusqlite-based) support for `UPDATE ... RETURNING` was not
+/// confirmed available in this codebase (no existing call site uses it), so
+/// this claims atomically-enough for a single-node embedded Raft/SQLite
+/// setup via an UPDATE tagging the oldest queued row with a unique
+/// `claimed_by` token, followed by a SELECT for that same tag, rather than
+/// relying on RETURNING.
+async fn runner_claim_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> ServerResult<Response> {
+    let claims = auth::extract_user_from_headers(
+        &headers,
+        &state.app_ctx.jwt_secret,
+        Some(&DbTokenLookup {
+            db: state.app_ctx.db.clone(),
+        }),
+    )
+    .await
+    .ok_or(ServerError::Unauthorized)?;
+    let _ = claims;
+
+    let claim_tag = Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let updated = state
+        .app_ctx
+        .db
+        .execute(
+            "UPDATE runner_jobs SET status = ?1, claimed_by = ?2, claimed_at = ?3 \
+             WHERE id = (SELECT id FROM runner_jobs WHERE status = ?4 ORDER BY created_at ASC LIMIT 1)",
+            params!(
+                entity::runner_job::status::CLAIMED.to_string(),
+                claim_tag.clone(),
+                now,
+                entity::runner_job::status::QUEUED.to_string()
+            ),
+        )
+        .await?;
+
+    if updated == 0 {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+
+    let claimed = state
+        .app_ctx
+        .db
+        .query_as::<entity::runner_job::Model, _>(
+            "SELECT * FROM runner_jobs WHERE claimed_by = ?1 AND status = ?2 ORDER BY claimed_at DESC LIMIT 1",
+            params!(claim_tag, entity::runner_job::status::CLAIMED.to_string()),
+        )
+        .await?
+        .into_iter()
+        .next();
+
+    let Some(job) = claimed else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+
+    Ok(axum::Json(serde_json::json!({
+        "id": job.id,
+        "kind": job.kind,
+        "payload": job.payload,
+    }))
+    .into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct RunnerCompleteRequest {
+    status: String,
+    #[allow(dead_code)]
+    logs: String,
+}
+
+/// `POST /runner/jobs/:id/complete` -- reports the result of a job claimed
+/// via `/runner/claim`. Updates the `runner_jobs` row and, if the job is
+/// tied to a `workflow_run` (`workflow_run_id` set), updates that row's
+/// status too.
+///
+/// The status-update-on-completion logic here is a minimal, deliberately
+/// duplicated variant of the equivalent block in `process_push_workflows`
+/// above (same UPDATE against `workflow_runs`) -- see that function's
+/// `DUAL-PATH` comment for context on why both an in-process path and this
+/// queue-based path exist simultaneously. A shared helper was not factored
+/// out to keep this change purely additive to the existing, working
+/// in-process path.
+async fn runner_complete_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    axum::Json(body): axum::Json<RunnerCompleteRequest>,
+) -> ServerResult<Response> {
+    auth::extract_user_from_headers(
+        &headers,
+        &state.app_ctx.jwt_secret,
+        Some(&DbTokenLookup {
+            db: state.app_ctx.db.clone(),
+        }),
+    )
+    .await
+    .ok_or(ServerError::Unauthorized)?;
+
+    let job_id = Uuid::parse_str(&id)
+        .map_err(|_| ServerError::BadRequest("invalid job id".to_string()))?;
+
+    let status = match body.status.as_str() {
+        "success" => entity::runner_job::status::SUCCESS,
+        _ => entity::runner_job::status::FAILURE,
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let job = state
+        .app_ctx
+        .db
+        .query_as::<entity::runner_job::Model, _>(
+            "SELECT * FROM runner_jobs WHERE id = ?1",
+            params!(job_id.to_string()),
+        )
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ServerError::NotFound(format!("runner job {id} not found")))?;
+
+    state
+        .app_ctx
+        .db
+        .execute(
+            "UPDATE runner_jobs SET status = ?1, finished_at = ?2 WHERE id = ?3",
+            params!(status.to_string(), now.clone(), job_id.to_string()),
+        )
+        .await?;
+
+    if let Some(run_id) = job.workflow_run_id {
+        // duplicated from `process_push_workflows`'s workflow_run status
+        // update, see comment above on why this isn't factored into a
+        // shared helper yet.
+        let run_status = match status {
+            entity::runner_job::status::SUCCESS => entity::workflow_run::status::SUCCESS,
+            _ => entity::workflow_run::status::FAILURE,
+        };
+        let res = state
+            .app_ctx
+            .db
+            .execute(
+                "UPDATE workflow_runs SET status = ?1, finished_at = ?2 WHERE id = ?3",
+                params!(run_status.to_string(), now, run_id.to_string()),
+            )
+            .await;
+        if let Err(e) = res {
+            tracing::warn!("failed to update workflow_run from runner completion: {e}");
+        }
+    }
+
+    Ok(StatusCode::OK.into_response())
 }
 
 fn strip_git_suffix(name: &str) -> &str {

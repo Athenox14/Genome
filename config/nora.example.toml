@@ -1,0 +1,29 @@
+# Example config for the optional `nora` pull-through-cache/registry sidecar
+# (see docker-compose.yml). Not needed for core Genome function.
+#
+# Mount as /data/config.toml and set NORA_CONFIG_PATH=/data/config.toml, or
+# just rely on the equivalent NORA_* env vars already set in docker-compose.yml
+# -- this file exists to document the retention rule that the "evict cache
+# entries unused for 7 days" requirement maps to, since per-rule fields like
+# `older_than_days` aren't settable via a single flat env var.
+
+[cargo]
+proxy = "https://crates.io"
+
+[npm]
+proxy = "https://registry.npmjs.org"
+
+[pypi]
+proxy = "https://pypi.org/simple/"
+
+[retention]
+enabled = true
+interval = 86400 # re-check once a day
+
+# Evict any cached/proxied artifact untouched for 7 days, across all
+# ecosystems. This is distinct from NORA_CURATION_MIN_RELEASE_AGE (and its
+# per-ecosystem variants), which blocks packages *younger* than N days from
+# being served at all -- a curation/security gate, not cache eviction.
+[[retention.rules]]
+registry = "*"
+older_than_days = 7

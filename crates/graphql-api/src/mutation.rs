@@ -1898,12 +1898,48 @@ impl MutationRoot {
             finished_at: None,
         };
 
+        let secrets = load_repo_secrets(app, repo_id).await.unwrap_or_default();
+
+        // Record each job in `runner_jobs` for history/observability, with
+        // status `HANDLED_INPROCESS` (not `QUEUED`) since the in-process
+        // `tokio::spawn` + `executor.run_job` call below is about to run it
+        // -- `/runner/claim` only selects `QUEUED` rows, so this can never
+        // be double-executed by a connected standalone runner.
+        for job in workflow.jobs.values() {
+            let payload = serde_json::json!({
+                "run_id": run.id,
+                "job": job,
+                "repo_archive_b64": "",
+                "env_extra": serde_json::Map::<String, serde_json::Value>::new(),
+                "secrets": secrets,
+            })
+            .to_string();
+            let res = app
+                .db
+                .execute(
+                    "INSERT INTO runner_jobs (id, kind, repo_id, workflow_run_id, payload, status, claimed_by, claimed_at, created_at, finished_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, NULL)",
+                    params!(
+                        Uuid::new_v4().to_string(),
+                        entity::runner_job::kind::CI_JOB.to_string(),
+                        Some(repo_id.to_string()),
+                        Some(run.id.to_string()),
+                        payload,
+                        entity::runner_job::status::HANDLED_INPROCESS.to_string(),
+                        Utc::now().to_rfc3339()
+                    ),
+                )
+                .await;
+            if let Err(e) = res {
+                tracing::warn!("failed to record runner_job history row (non-fatal): {e}");
+            }
+        }
+
         // Spawn execution of every job in the background; this is fire-and-forget
         // since GraphQL mutations should return promptly. Job/run status updates
         // would normally be persisted by a background task watching JobResults.
         let executor = app.actions_executor.clone();
         let jobs: Vec<_> = workflow.jobs.into_values().collect();
-        let secrets = load_repo_secrets(app, repo_id).await.unwrap_or_default();
         let run_id = run.id;
         let db = app.db.clone();
         tokio::spawn(async move {

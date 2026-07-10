@@ -21,7 +21,7 @@ WORKDIR /usr/src/genome
 COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
 
-RUN cargo build --release --bin server
+RUN cargo build --release --bin server --bin runner
 
 ########################################
 # Stage 2: runtime
@@ -43,6 +43,13 @@ RUN groupadd --system genome && \
 WORKDIR /app
 
 COPY --from=builder /usr/src/genome/target/release/server /app/server
+# Also copy the optional standalone `runner` binary into the same image so
+# docker-compose (or any other orchestrator) can target it as a separate
+# service using this same image with a different entrypoint/command --
+# see the commented-out `runner` service in docker-compose.yml. It is not
+# started by `ENTRYPOINT` below; the `server` binary keeps running CI jobs
+# in-process regardless of whether any `runner` container exists.
+COPY --from=builder /usr/src/genome/target/release/runner /app/runner
 
 # Optional default configuration shipped with the image; the runtime
 # config directory can be overridden with a bind mount at deploy time.

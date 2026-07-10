@@ -82,6 +82,7 @@ pub mod repo_collaborator;
 pub mod repo_mirror;
 pub mod repo_secret;
 pub mod repository;
+pub mod runner_job;
 pub mod ssh_key;
 pub mod user;
 pub mod webhook;
@@ -117,6 +118,7 @@ pub mod prelude {
     pub use super::repo_mirror::Model as RepoMirror;
     pub use super::repo_secret::Model as RepoSecret;
     pub use super::repository::Model as Repository;
+    pub use super::runner_job::Model as RunnerJob;
     pub use super::ssh_key::Model as SshKey;
     pub use super::user::Model as User;
     pub use super::webhook::Model as Webhook;

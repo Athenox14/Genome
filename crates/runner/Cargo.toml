@@ -1,0 +1,25 @@
+[package]
+name = "runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "runner"
+path = "src/main.rs"
+
+[dependencies]
+actions = { path = "../actions" }
+dev-env = { path = "../dev-env" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }

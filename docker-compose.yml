@@ -17,6 +17,59 @@ services:
       - ./data/hiqlite:/data/hiqlite
       - /var/run/docker.sock:/var/run/docker.sock
 
+  # Optional: standalone poll-based CI runner (crates/runner). Not required --
+  # `server` already executes every CI job in-process. Enable this (and scale
+  # it out to multiple replicas) to also offload job execution onto separate
+  # host(s)/container(s) that poll `server`'s /runner/claim HTTP route instead
+  # of running in the same process as the web server. Uses the same built
+  # image as `server` (see Dockerfile's `/app/runner` binary) with a different
+  # entrypoint/command.
+  # runner:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   entrypoint: ["/app/runner"]
+  #   restart: unless-stopped
+  #   environment:
+  #     GENOME_SERVER_URL: http://server:8000
+  #     GENOME_RUNNER_TOKEN: replace-with-a-real-personal-access-token
+  #     GENOME_RUNNER_ARTIFACTS_DIR: /data/runner-artifacts
+  #     DOCKER_SOCKET_PATH: /var/run/docker.sock
+  #   depends_on:
+  #     - server
+  #   volumes:
+  #     - ./data/runner-artifacts:/data/runner-artifacts
+  #     - /var/run/docker.sock:/var/run/docker.sock
+
+  # Optional: multi-ecosystem package registry + pull-through cache (npm, Cargo,
+  # PyPI, Maven, Docker/OCI, Go, RubyGems, NuGet, Conan, Terraform, and more),
+  # backed by https://github.com/getnora-io/nora. Not required for core Genome
+  # function (git/CI/issues/etc. all work without it) — it only accelerates and
+  # caches dependency installs for CI jobs and local dev. Genome's own minimal
+  # hand-rolled `PUT`/`GET /packages/:owner/:name/:version` routes keep working
+  # independently of this service. Point CI package managers (npm, cargo, pip,
+  # ...) at this service's registry endpoints instead of the public ones to get
+  # caching. Omit this service entirely if you don't need it.
+  nora:
+    image: getnora/nora:latest
+    restart: unless-stopped
+    environment:
+      # Per-ecosystem pull-through-cache upstreams.
+      NORA_CARGO_PROXY: https://crates.io
+      NORA_NPM_PROXY: https://registry.npmjs.org
+      NORA_PYPI_PROXY: https://pypi.org/simple/
+      # Evict cached artifacts unused for 7 days (this is the cache/retention
+      # TTL, NOT NORA_CURATION_MIN_RELEASE_AGE which is an unrelated curation
+      # gate that blocks packages *younger* than N days from being pulled).
+      NORA_RETENTION_ENABLED: "true"
+      NORA_RETENTION_INTERVAL: "86400" # check once a day
+      NORA_CONFIG_PATH: /data/config.toml
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./data/nora:/data
+      - ./config/nora.example.toml:/data/config.toml:ro
+
   frontend:
     build:
       context: ./frontend

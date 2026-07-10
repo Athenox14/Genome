@@ -2419,6 +2419,7 @@ dependencies = [
  "async-graphql-axum",
  "auth",
  "axum 0.7.9",
+ "base64 0.22.1",
  "chrono",
  "cryptr",
  "dev-env",
@@ -4699,6 +4700,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "runner"
+version = "0.1.0"
+dependencies = [
+ "actions",
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "dev-env",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.40.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5359,6 +5379,7 @@ dependencies = [
  "async-trait",
  "auth",
  "axum 0.7.9",
+ "base64 0.22.1",
  "bollard",
  "chrono",
  "cryptr",

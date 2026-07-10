@@ -36,9 +36,46 @@ Rust workspace, one crate per concern:
 | `webhooks` | HMAC-signed webhook dispatch |
 | `graphql-api` | The GraphQL schema (async-graphql) wiring everything together |
 | `server` | axum binary: HTTP router (GraphQL, git smart-HTTP, packages, artifacts), spawns the SSH server, embeds the Hiqlite database node, and runs background loops (mirror sync, workspace auto-stop) |
+| `runner` | **Optional**, standalone poll-based binary. Polls the main `server`'s `/runner/claim` HTTP route for queued CI jobs (`runner_jobs` table) and executes them locally via the same `actions::Executor`/`actions::Workflow` logic the server uses in-process, reporting results back to `/runner/jobs/:id/complete`. The `server` binary keeps running every CI job in-process exactly as before regardless of whether any `runner` is connected — the two paths are additive, not a replacement (see the `// DUAL-PATH:` comments in `crates/server/src/main.rs` and `crates/graphql-api/src/mutation.rs`). Also carries a `dev_env::WorkspaceManager` dependency as a forward-compat stub for eventual dev-workspace-hosting polling (not implemented yet). |
 
 `frontend/` is an independent Nuxt 3 + Vue 3 app for browsing/testing against
 the GraphQL API — not required for production use.
+
+### Package registry
+
+Genome's own `server` binary has a minimal built-in package store —
+`PUT`/`GET /packages/:owner/:name/:version` — that accepts a raw blob per
+version and records one DB row per version. It has no real per-ecosystem
+protocol support (npm/cargo/pip clients can't point at it directly); it's kept
+around because it's small, live-tested, and still useful for simple
+CI-artifact-style storage.
+
+For actual multi-ecosystem package hosting *and* pull-through caching of
+upstream registries (npm, Cargo, PyPI, Maven, Docker/OCI, Go, RubyGems,
+NuGet, Conan, Terraform, and more — so CI jobs get faster/more reliable
+dependency installs), run the optional `nora` service defined in
+`docker-compose.yml`, backed by [nora-registry](https://github.com/getnora-io/nora).
+
+We investigated embedding `nora-registry` directly into the `server` binary
+(`.nest()`-ing its router into Genome's own `axum::Router`, so it would run in
+the same process). That turned out not to be feasible: `nora-registry`'s
+published crate does have a `[lib]` target, but its public API
+(`src/lib.rs`) is documented as "library interface for fuzzing and testing"
+and only exposes manifest-validation helpers — no `Router`, `App`, or builder
+type is exported. All the actual axum wiring lives in private modules behind
+its `main.rs` binary. So it's integrated instead as a **separate sidecar
+container** (official image `getnora/nora:latest`) in `docker-compose.yml`,
+configured via `NORA_CARGO_PROXY`/`NORA_NPM_PROXY`/`NORA_PYPI_PROXY` (proxying
+to `crates.io`, `registry.npmjs.org`, `pypi.org`) plus a retention rule (see
+`config/nora.example.toml`) that evicts any cached artifact **unused for 7
+days** (`[[retention.rules]] registry = "*", older_than_days = 7`, checked via
+`NORA_RETENTION_INTERVAL`). This is intentionally distinct from NORA's
+`NORA_CURATION_MIN_RELEASE_AGE` setting, which is an unrelated curation gate
+that blocks packages *younger* than N days from being served at all.
+
+This service is entirely optional — Genome's core git/CI/issues/GraphQL
+functionality does not depend on it; it only accelerates CI dependency
+installs when present.
 
 ## Running locally
 
