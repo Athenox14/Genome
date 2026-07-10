@@ -21,9 +21,27 @@ use async_graphql::Request;
 use migration::MigratorTrait;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde_json::json;
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use graphql_api::{build_schema, AppContext, GraphQLSchema, RequestContext};
+
+/// `cargo test` runs tests in this file concurrently by default, but
+/// `Migrator::up` is not safe to call concurrently against a fresh database:
+/// two racing callers both try to create Postgres's own `seaql_migrations`
+/// tracking type and one loses a unique-constraint race. Run it exactly once
+/// per test-binary process; every test just awaits the same completion.
+static MIGRATIONS_DONE: OnceCell<()> = OnceCell::const_new();
+
+async fn ensure_migrated(db: &DatabaseConnection) {
+    MIGRATIONS_DONE
+        .get_or_init(|| async {
+            migration::Migrator::up(db, None)
+                .await
+                .expect("failed to run migrations against test database");
+        })
+        .await;
+}
 
 /// Builds a fresh `AppContext` (and schema) wired up to the test database,
 /// with `RepoManager` pointed at a throwaway temp directory so created bare
@@ -38,9 +56,7 @@ async fn test_schema() -> (GraphQLSchema, AppContext, tempfile::TempDir) {
         .await
         .expect("failed to connect to test database (is DATABASE_URL reachable?)");
 
-    migration::Migrator::up(&db, None)
-        .await
-        .expect("failed to run migrations against test database");
+    ensure_migrated(&db).await;
 
     let repos_tmp = tempfile::tempdir().expect("failed to create temp dir for repos root");
     let artifacts_tmp = tempfile::tempdir().expect("failed to create temp dir for artifacts root");
