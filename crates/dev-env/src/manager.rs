@@ -5,6 +5,7 @@ use bollard::container::{
     StartContainerOptions, StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
+use bollard::image::CreateImageOptions;
 use bollard::models::{HostConfig, PortBinding};
 use bollard::Docker;
 use futures_util::StreamExt;
@@ -170,6 +171,23 @@ impl WorkspaceManager {
             name: name.to_string(),
             platform: None,
         };
+
+        // Ensure the image is present locally before creating the container. Pulling
+        // an already-present image is a no-op, so we always attempt it rather than
+        // trying to detect whether it's needed first.
+        {
+            let mut stream = self.docker.create_image(
+                Some(CreateImageOptions {
+                    from_image: image.to_string(),
+                    ..Default::default()
+                }),
+                None,
+                None,
+            );
+            while let Some(item) = stream.next().await {
+                item.map_err(DevEnvError::Docker)?;
+            }
+        }
 
         let created = self
             .docker
