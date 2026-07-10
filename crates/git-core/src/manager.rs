@@ -74,8 +74,24 @@ impl RepoManager {
     /// scope here.
     fn write_pre_receive_hook(repo_path: &Path, owner: &str, name: &str) -> Result<()> {
         let current_exe = std::env::current_exe().map_err(GitCoreError::Io)?;
+        // The hook runs with a cwd controlled by git (typically the repo dir
+        // itself, sometimes different depending on transport), so a relative
+        // `repo_path` embedded in the script would resolve against the wrong
+        // directory. Canonicalize to an absolute path at write time.
+        let absolute_repo_path = repo_path
+            .canonicalize()
+            .map(|p| {
+                // On Windows, `canonicalize()` returns a `\\?\`-prefixed verbatim
+                // path, which git-for-windows' MSYS `/bin/sh` and git2 don't
+                // reliably handle. Strip the prefix; the remaining path is
+                // still absolute.
+                let s = p.to_string_lossy().to_string();
+                let stripped = s.strip_prefix(r"\\?\").map(String::from).unwrap_or(s);
+                PathBuf::from(stripped)
+            })
+            .unwrap_or_else(|_| repo_path.to_path_buf());
         let exe_display = current_exe.to_string_lossy().replace('"', "\\\"");
-        let repo_display = repo_path.to_string_lossy().replace('"', "\\\"");
+        let repo_display = absolute_repo_path.to_string_lossy().replace('"', "\\\"");
 
         let script = format!(
             "#!/bin/sh\n\
@@ -273,6 +289,24 @@ impl RepoManager {
         descendant_sha: &str,
     ) -> Result<bool> {
         let (repo, _) = self.open(owner, name)?;
+        // When this runs from a `pre-receive` hook, the newly-pushed objects
+        // haven't been migrated into the repo's main object store yet --
+        // git keeps them in a temporary "quarantine" object directory
+        // (exposed via GIT_OBJECT_DIRECTORY / GIT_ALTERNATE_OBJECT_DIRECTORIES
+        // env vars, which git sets for hook subprocesses) until the push is
+        // fully accepted. Register those as odb alternates so lookups here
+        // can actually see the new commit.
+        if let Ok(quarantine_dir) = std::env::var("GIT_OBJECT_DIRECTORY") {
+            let _ = repo.odb()?.add_disk_alternate(&quarantine_dir);
+        }
+        if let Ok(alternates) = std::env::var("GIT_ALTERNATE_OBJECT_DIRECTORIES") {
+            let sep = if cfg!(windows) { ';' } else { ':' };
+            for path in alternates.split(sep) {
+                if !path.is_empty() {
+                    let _ = repo.odb()?.add_disk_alternate(path);
+                }
+            }
+        }
         let ancestor_oid = git2::Oid::from_str(ancestor_sha)
             .map_err(|_| GitCoreError::RefNotFound(ancestor_sha.to_string()))?;
         let descendant_oid = git2::Oid::from_str(descendant_sha)
