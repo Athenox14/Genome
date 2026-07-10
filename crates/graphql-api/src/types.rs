@@ -1,6 +1,6 @@
 use async_graphql::{ComplexObject, Context, SimpleObject};
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use hiqlite::params;
 use uuid::Uuid;
 
 use crate::context::AppContext;
@@ -48,10 +48,7 @@ pub struct RepositoryObject {
 }
 
 impl RepositoryObject {
-    pub async fn from_model(
-        db: &sea_orm::DatabaseConnection,
-        m: entity::repository::Model,
-    ) -> Self {
+    pub async fn from_model(db: &hiqlite::Client, m: entity::repository::Model) -> Self {
         let owner_login = resolve_owner_login(db, &m.owner_type, m.owner_id)
             .await
             .unwrap_or_default();
@@ -69,25 +66,25 @@ impl RepositoryObject {
     }
 }
 
-pub async fn resolve_owner_login(
-    db: &sea_orm::DatabaseConnection,
-    owner_type: &str,
-    owner_id: Uuid,
-) -> Option<String> {
+pub async fn resolve_owner_login(db: &hiqlite::Client, owner_type: &str, owner_id: Uuid) -> Option<String> {
     if owner_type == "organization" {
-        entity::prelude::Organization::find_by_id(owner_id)
-            .one(db)
-            .await
-            .ok()
-            .flatten()
-            .map(|o| o.name)
+        db.query_as::<entity::organization::Model, _>(
+            "SELECT * FROM organizations WHERE id = ?1",
+            params!(owner_id.to_string()),
+        )
+        .await
+        .ok()
+        .and_then(|v| v.into_iter().next())
+        .map(|o| o.name)
     } else {
-        entity::prelude::User::find_by_id(owner_id)
-            .one(db)
-            .await
-            .ok()
-            .flatten()
-            .map(|u| u.username)
+        db.query_as::<entity::user::Model, _>(
+            "SELECT * FROM users WHERE id = ?1",
+            params!(owner_id.to_string()),
+        )
+        .await
+        .ok()
+        .and_then(|v| v.into_iter().next())
+        .map(|u| u.username)
     }
 }
 
@@ -111,39 +108,48 @@ impl RepositoryObject {
 
     async fn issues(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<IssueObject>> {
         let app = ctx.data::<AppContext>()?;
-        let issues = entity::prelude::Issue::find()
-            .filter(entity::issue::Column::RepoId.eq(self.id))
-            .order_by_desc(entity::issue::Column::CreatedAt)
-            .all(&app.db)
+        let issues = app
+            .db
+            .query_as::<entity::issue::Model, _>(
+                "SELECT * FROM issues WHERE repo_id = ?1 ORDER BY created_at DESC",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(issues.into_iter().map(IssueObject::from).collect())
     }
 
     async fn pull_requests(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<PullRequestObject>> {
         let app = ctx.data::<AppContext>()?;
-        let prs = entity::prelude::PullRequest::find()
-            .filter(entity::pull_request::Column::RepoId.eq(self.id))
-            .order_by_desc(entity::pull_request::Column::CreatedAt)
-            .all(&app.db)
+        let prs = app
+            .db
+            .query_as::<entity::pull_request::Model, _>(
+                "SELECT * FROM pull_requests WHERE repo_id = ?1 ORDER BY created_at DESC",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(prs.into_iter().map(PullRequestObject::from).collect())
     }
 
     async fn workflow_runs(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<WorkflowRunObject>> {
         let app = ctx.data::<AppContext>()?;
-        let runs = entity::prelude::WorkflowRun::find()
-            .filter(entity::workflow_run::Column::RepoId.eq(self.id))
-            .all(&app.db)
+        let runs = app
+            .db
+            .query_as::<entity::workflow_run::Model, _>(
+                "SELECT * FROM workflow_runs WHERE repo_id = ?1",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(runs.into_iter().map(WorkflowRunObject::from).collect())
     }
 
     async fn packages(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<PackageObject>> {
         let app = ctx.data::<AppContext>()?;
-        let packages = entity::prelude::Package::find()
-            .filter(entity::package::Column::RepoId.eq(self.id))
-            .order_by_desc(entity::package::Column::CreatedAt)
-            .all(&app.db)
+        let packages = app
+            .db
+            .query_as::<entity::package::Model, _>(
+                "SELECT * FROM packages WHERE repo_id = ?1 ORDER BY created_at DESC",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(packages.into_iter().map(PackageObject::from).collect())
     }
@@ -152,9 +158,12 @@ impl RepositoryObject {
     /// are never exposed via GraphQL (write-only, standard practice).
     async fn secret_names(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<String>> {
         let app = ctx.data::<AppContext>()?;
-        let secrets = entity::prelude::RepoSecret::find()
-            .filter(entity::repo_secret::Column::RepoId.eq(self.id))
-            .all(&app.db)
+        let secrets = app
+            .db
+            .query_as::<entity::repo_secret::Model, _>(
+                "SELECT * FROM repo_secrets WHERE repo_id = ?1",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(secrets.into_iter().map(|s| s.name).collect())
     }
@@ -219,9 +228,12 @@ impl RepositoryObject {
         ctx: &Context<'_>,
     ) -> async_graphql::Result<Vec<BranchProtectionRuleObject>> {
         let app = ctx.data::<AppContext>()?;
-        let rules = entity::prelude::BranchProtectionRule::find()
-            .filter(entity::branch_protection_rule::Column::RepoId.eq(self.id))
-            .all(&app.db)
+        let rules = app
+            .db
+            .query_as::<entity::branch_protection_rule::Model, _>(
+                "SELECT * FROM branch_protection_rules WHERE repo_id = ?1",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(rules.into_iter().map(BranchProtectionRuleObject::from).collect())
     }
@@ -233,29 +245,36 @@ impl RepositoryObject {
         #[graphql(default = 20)] limit: i32,
     ) -> async_graphql::Result<Vec<ActivityEventObject>> {
         let app = ctx.data::<AppContext>()?;
-        let events = entity::prelude::ActivityEvent::find()
-            .filter(entity::activity_event::Column::RepoId.eq(self.id))
-            .order_by_desc(entity::activity_event::Column::CreatedAt)
-            .limit(limit.max(0) as u64)
-            .all(&app.db)
+        let events = app
+            .db
+            .query_as::<entity::activity_event::Model, _>(
+                "SELECT * FROM activity_events WHERE repo_id = ?1 ORDER BY created_at DESC LIMIT ?2",
+                params!(self.id.to_string(), limit.max(0) as i64),
+            )
             .await?;
         Ok(events.into_iter().map(ActivityEventObject::from).collect())
     }
 
     async fn labels(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<LabelObject>> {
         let app = ctx.data::<AppContext>()?;
-        let labels = entity::prelude::Label::find()
-            .filter(entity::label::Column::RepoId.eq(self.id))
-            .all(&app.db)
+        let labels = app
+            .db
+            .query_as::<entity::label::Model, _>(
+                "SELECT * FROM labels WHERE repo_id = ?1",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(labels.into_iter().map(LabelObject::from).collect())
     }
 
     async fn milestones(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<MilestoneObject>> {
         let app = ctx.data::<AppContext>()?;
-        let milestones = entity::prelude::Milestone::find()
-            .filter(entity::milestone::Column::RepoId.eq(self.id))
-            .all(&app.db)
+        let milestones = app
+            .db
+            .query_as::<entity::milestone::Model, _>(
+                "SELECT * FROM milestones WHERE repo_id = ?1",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(milestones.into_iter().map(MilestoneObject::from).collect())
     }
@@ -263,18 +282,24 @@ impl RepositoryObject {
     /// Kanban projects for this repository.
     async fn projects(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<ProjectObject>> {
         let app = ctx.data::<AppContext>()?;
-        let projects = entity::prelude::Project::find()
-            .filter(entity::project::Column::RepoId.eq(self.id))
-            .all(&app.db)
+        let projects = app
+            .db
+            .query_as::<entity::project::Model, _>(
+                "SELECT * FROM projects WHERE repo_id = ?1",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(projects.into_iter().map(ProjectObject::from).collect())
     }
 
     async fn webhooks(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<WebhookObject>> {
         let app = ctx.data::<AppContext>()?;
-        let hooks = entity::prelude::Webhook::find()
-            .filter(entity::webhook::Column::RepoId.eq(self.id))
-            .all(&app.db)
+        let hooks = app
+            .db
+            .query_as::<entity::webhook::Model, _>(
+                "SELECT * FROM webhooks WHERE repo_id = ?1",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(hooks.into_iter().map(WebhookObject::from).collect())
     }
@@ -282,13 +307,25 @@ impl RepositoryObject {
     /// Users granted explicit collaborator access to this repository.
     async fn collaborators(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<CollaboratorObject>> {
         let app = ctx.data::<AppContext>()?;
-        let collabs = entity::prelude::RepoCollaborator::find()
-            .filter(entity::repo_collaborator::Column::RepoId.eq(self.id))
-            .all(&app.db)
+        let collabs = app
+            .db
+            .query_as::<entity::repo_collaborator::Model, _>(
+                "SELECT * FROM repo_collaborators WHERE repo_id = ?1",
+                params!(self.id.to_string()),
+            )
             .await?;
         let mut out = Vec::with_capacity(collabs.len());
         for c in collabs {
-            if let Some(user) = entity::prelude::User::find_by_id(c.user_id).one(&app.db).await? {
+            if let Some(user) = app
+                .db
+                .query_as::<entity::user::Model, _>(
+                    "SELECT * FROM users WHERE id = ?1",
+                    params!(c.user_id.to_string()),
+                )
+                .await?
+                .into_iter()
+                .next()
+            {
                 out.push(CollaboratorObject {
                     user: UserObject::from(user),
                     permission: c.permission,
@@ -336,18 +373,21 @@ impl From<entity::issue::Model> for IssueObject {
 impl IssueObject {
     async fn labels(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<LabelObject>> {
         let app = ctx.data::<AppContext>()?;
-        let links = entity::prelude::IssueLabel::find()
-            .filter(entity::issue_label::Column::IssueId.eq(self.id))
-            .all(&app.db)
+        let links = app
+            .db
+            .query_as::<entity::issue_label::Model, _>(
+                "SELECT * FROM issue_labels WHERE issue_id = ?1",
+                params!(self.id.to_string()),
+            )
             .await?;
         let label_ids: Vec<Uuid> = links.into_iter().map(|l| l.label_id).collect();
         if label_ids.is_empty() {
             return Ok(vec![]);
         }
-        let labels = entity::prelude::Label::find()
-            .filter(entity::label::Column::Id.is_in(label_ids))
-            .all(&app.db)
-            .await?;
+        let placeholders: Vec<String> = (1..=label_ids.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!("SELECT * FROM labels WHERE id IN ({})", placeholders.join(", "));
+        let params_vec: Vec<hiqlite::Param> = label_ids.iter().map(|id| hiqlite::Param::Text(id.to_string())).collect();
+        let labels = app.db.query_as::<entity::label::Model, _>(sql, params_vec).await?;
         Ok(labels.into_iter().map(LabelObject::from).collect())
     }
 
@@ -356,9 +396,15 @@ impl IssueObject {
             return Ok(None);
         };
         let app = ctx.data::<AppContext>()?;
-        let milestone = entity::prelude::Milestone::find_by_id(mid)
-            .one(&app.db)
-            .await?;
+        let milestone = app
+            .db
+            .query_as::<entity::milestone::Model, _>(
+                "SELECT * FROM milestones WHERE id = ?1",
+                params!(mid.to_string()),
+            )
+            .await?
+            .into_iter()
+            .next();
         Ok(milestone.map(MilestoneObject::from))
     }
 }
@@ -470,9 +516,12 @@ impl WorkflowRunObject {
     /// run's jobs.
     async fn artifacts(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<ArtifactObject>> {
         let app = ctx.data::<AppContext>()?;
-        let artifacts = entity::prelude::WorkflowArtifact::find()
-            .filter(entity::workflow_artifact::Column::RunId.eq(self.id))
-            .all(&app.db)
+        let artifacts = app
+            .db
+            .query_as::<entity::workflow_artifact::Model, _>(
+                "SELECT * FROM workflow_artifacts WHERE run_id = ?1",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(artifacts.into_iter().map(ArtifactObject::from).collect())
     }
@@ -725,10 +774,12 @@ impl PrReviewObject {
     /// Inline comments left on specific lines of the diff as part of this review.
     async fn comments(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<PrReviewCommentObject>> {
         let app = ctx.data::<AppContext>()?;
-        let comments = entity::prelude::PrReviewComment::find()
-            .filter(entity::pr_review_comment::Column::ReviewId.eq(self.id))
-            .order_by_asc(entity::pr_review_comment::Column::CreatedAt)
-            .all(&app.db)
+        let comments = app
+            .db
+            .query_as::<entity::pr_review_comment::Model, _>(
+                "SELECT * FROM pr_review_comments WHERE review_id = ?1 ORDER BY created_at ASC",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(comments.into_iter().map(PrReviewCommentObject::from).collect())
     }
@@ -835,10 +886,12 @@ impl ProjectObject {
     /// Columns belonging to this project, in display order.
     async fn columns(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<ProjectColumnObject>> {
         let app = ctx.data::<AppContext>()?;
-        let columns = entity::prelude::ProjectColumn::find()
-            .filter(entity::project_column::Column::ProjectId.eq(self.id))
-            .order_by_asc(entity::project_column::Column::Position)
-            .all(&app.db)
+        let columns = app
+            .db
+            .query_as::<entity::project_column::Model, _>(
+                "SELECT * FROM project_columns WHERE project_id = ?1 ORDER BY position ASC",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(columns.into_iter().map(ProjectColumnObject::from).collect())
     }
@@ -869,10 +922,12 @@ impl ProjectColumnObject {
     /// Cards placed in this column, in display order.
     async fn cards(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<ProjectCardObject>> {
         let app = ctx.data::<AppContext>()?;
-        let cards = entity::prelude::ProjectCard::find()
-            .filter(entity::project_card::Column::ColumnId.eq(self.id))
-            .order_by_asc(entity::project_card::Column::Position)
-            .all(&app.db)
+        let cards = app
+            .db
+            .query_as::<entity::project_card::Model, _>(
+                "SELECT * FROM project_cards WHERE column_id = ?1 ORDER BY position ASC",
+                params!(self.id.to_string()),
+            )
             .await?;
         Ok(cards.into_iter().map(ProjectCardObject::from).collect())
     }
@@ -908,7 +963,12 @@ impl ProjectCardObject {
             return Ok(None);
         };
         let app = ctx.data::<AppContext>()?;
-        let issue = entity::prelude::Issue::find_by_id(iid).one(&app.db).await?;
+        let issue = app
+            .db
+            .query_as::<entity::issue::Model, _>("SELECT * FROM issues WHERE id = ?1", params!(iid.to_string()))
+            .await?
+            .into_iter()
+            .next();
         Ok(issue.map(IssueObject::from))
     }
 }
@@ -927,7 +987,7 @@ pub struct AccessTokenObject {
 
 impl From<entity::access_token::Model> for AccessTokenObject {
     fn from(m: entity::access_token::Model) -> Self {
-        let scopes = serde_json::from_value(m.scopes).unwrap_or_default();
+        let scopes = serde_json::from_str(&m.scopes).unwrap_or_default();
         Self {
             id: m.id,
             name: m.name,
@@ -956,7 +1016,7 @@ pub struct WebhookObject {
 
 impl From<entity::webhook::Model> for WebhookObject {
     fn from(m: entity::webhook::Model) -> Self {
-        let events = serde_json::from_value(m.events).unwrap_or_default();
+        let events = serde_json::from_str(&m.events).unwrap_or_default();
         Self {
             id: m.id,
             repo_id: m.repo_id,

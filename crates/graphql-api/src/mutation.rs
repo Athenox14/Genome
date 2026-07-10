@@ -1,10 +1,8 @@
 use async_graphql::{Context, Object};
 use auth::{Claims, ClaimsInput, Permission};
 use chrono::Utc;
+use hiqlite::params;
 use regex::Regex;
-use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set,
-};
 use std::sync::OnceLock;
 use uuid::Uuid;
 
@@ -32,39 +30,50 @@ async fn notify(
     subject_id: Uuid,
     message: String,
 ) {
-    let notification = entity::notification::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        user_id: Set(user_id),
-        kind: Set(kind.to_string()),
-        repo_id: Set(repo_id),
-        subject_id: Set(subject_id),
-        message: Set(message),
-        read_at: Set(None),
-        created_at: Set(Utc::now()),
-    };
-    if let Err(e) = notification.insert(&app.db).await {
+    let id = Uuid::new_v4();
+    let created_at = Utc::now();
+    let res = app
+        .db
+        .execute(
+            "INSERT INTO notifications (id, user_id, kind, repo_id, subject_id, message, read_at, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+            params!(
+                id.to_string(),
+                user_id.to_string(),
+                kind.to_string(),
+                repo_id.to_string(),
+                subject_id.to_string(),
+                message,
+                created_at.to_rfc3339()
+            ),
+        )
+        .await;
+    if let Err(e) = res {
         tracing::warn!("failed to insert notification: {e}");
     }
 }
 
 /// Best-effort activity feed insert: logs and swallows any error so that a
 /// failure to record activity never fails the mutation that triggered it.
-async fn record_activity(
-    app: &AppContext,
-    repo_id: Option<Uuid>,
-    actor_id: Uuid,
-    kind: &str,
-    summary: String,
-) {
-    let event = entity::activity_event::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        repo_id: Set(repo_id),
-        actor_id: Set(actor_id),
-        kind: Set(kind.to_string()),
-        summary: Set(summary),
-        created_at: Set(Utc::now()),
-    };
-    if let Err(e) = event.insert(&app.db).await {
+async fn record_activity(app: &AppContext, repo_id: Option<Uuid>, actor_id: Uuid, kind: &str, summary: String) {
+    let id = Uuid::new_v4();
+    let created_at = Utc::now();
+    let res = app
+        .db
+        .execute(
+            "INSERT INTO activity_events (id, repo_id, actor_id, kind, summary, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params!(
+                id.to_string(),
+                repo_id.map(|r| r.to_string()),
+                actor_id.to_string(),
+                kind.to_string(),
+                summary,
+                created_at.to_rfc3339()
+            ),
+        )
+        .await;
+    if let Err(e) = res {
         tracing::warn!("failed to insert activity event: {e}");
     }
 }
@@ -129,22 +138,29 @@ async fn repo_permission(
     let is_owner = repo.owner_type == "user" && repo.owner_id == user_id;
 
     let is_admin_org_role = if repo.owner_type == "organization" {
-        entity::prelude::OrgMember::find()
-            .filter(entity::org_member::Column::OrgId.eq(repo.owner_id))
-            .filter(entity::org_member::Column::UserId.eq(user_id))
-            .one(&app.db)
+        app.db
+            .query_as::<entity::org_member::Model, _>(
+                "SELECT * FROM org_members WHERE org_id = ?1 AND user_id = ?2",
+                params!(repo.owner_id.to_string(), user_id.to_string()),
+            )
             .await?
+            .into_iter()
+            .next()
             .map(|m| m.role == entity::org_member::role::OWNER || m.role == entity::org_member::role::ADMIN)
             .unwrap_or(false)
     } else {
         false
     };
 
-    let collaborator_perm = entity::prelude::RepoCollaborator::find()
-        .filter(entity::repo_collaborator::Column::RepoId.eq(repo.id))
-        .filter(entity::repo_collaborator::Column::UserId.eq(user_id))
-        .one(&app.db)
+    let collaborator_perm = app
+        .db
+        .query_as::<entity::repo_collaborator::Model, _>(
+            "SELECT * FROM repo_collaborators WHERE repo_id = ?1 AND user_id = ?2",
+            params!(repo.id.to_string(), user_id.to_string()),
+        )
         .await?
+        .into_iter()
+        .next()
         .map(|c| match c.permission.as_str() {
             entity::repo_collaborator::permission::ADMIN => Permission::Admin,
             entity::repo_collaborator::permission::WRITE => Permission::Write,
@@ -162,11 +178,15 @@ async fn repo_permission(
 /// Errors unless the given user is an owner or admin of the organization
 /// (used to gate org membership management mutations).
 async fn require_org_admin(app: &AppContext, org_id: Uuid, user_id: Uuid) -> async_graphql::Result<()> {
-    let is_admin = entity::prelude::OrgMember::find()
-        .filter(entity::org_member::Column::OrgId.eq(org_id))
-        .filter(entity::org_member::Column::UserId.eq(user_id))
-        .one(&app.db)
+    let is_admin = app
+        .db
+        .query_as::<entity::org_member::Model, _>(
+            "SELECT * FROM org_members WHERE org_id = ?1 AND user_id = ?2",
+            params!(org_id.to_string(), user_id.to_string()),
+        )
         .await?
+        .into_iter()
+        .next()
         .map(|m| m.role == entity::org_member::role::OWNER || m.role == entity::org_member::role::ADMIN)
         .unwrap_or(false);
     if !is_admin {
@@ -176,9 +196,14 @@ async fn require_org_admin(app: &AppContext, org_id: Uuid, user_id: Uuid) -> asy
 }
 
 async fn find_repo(app: &AppContext, repo_id: Uuid) -> async_graphql::Result<entity::repository::Model> {
-    entity::prelude::Repository::find_by_id(repo_id)
-        .one(&app.db)
+    app.db
+        .query_as::<entity::repository::Model, _>(
+            "SELECT * FROM repositories WHERE id = ?1",
+            params!(repo_id.to_string()),
+        )
         .await?
+        .into_iter()
+        .next()
         .ok_or_else(|| async_graphql::Error::new("repository not found"))
 }
 
@@ -198,9 +223,12 @@ pub(crate) async fn load_repo_secrets(
     repo_id: Uuid,
 ) -> anyhow::Result<std::collections::HashMap<String, String>> {
     let key = secrets_encryption_key()?;
-    let rows = entity::prelude::RepoSecret::find()
-        .filter(entity::repo_secret::Column::RepoId.eq(repo_id))
-        .all(&app.db)
+    let rows = app
+        .db
+        .query_as::<entity::repo_secret::Model, _>(
+            "SELECT * FROM repo_secrets WHERE repo_id = ?1",
+            params!(repo_id.to_string()),
+        )
         .await?;
 
     let mut out = std::collections::HashMap::new();
@@ -234,20 +262,28 @@ impl MutationRoot {
         let password_hash = auth::hash_password(&password)
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-        let user = entity::user::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            username: Set(username),
-            email: Set(email),
-            password_hash: Set(password_hash),
-            is_admin: Set(false),
-            avatar_url: Set(None),
-            created_at: Set(Utc::now()),
-            totp_secret: Set(None),
-            totp_enabled: Set(false),
-            deactivated_at: Set(None),
-        };
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        app.db
+            .execute(
+                "INSERT INTO users (id, username, email, password_hash, is_admin, avatar_url, created_at, totp_secret, totp_enabled, deactivated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5, NULL, 0, NULL)",
+                params!(id.to_string(), username.clone(), email.clone(), password_hash.clone(), created_at.to_rfc3339()),
+            )
+            .await?;
 
-        let user = user.insert(&app.db).await?;
+        let user = entity::user::Model {
+            id,
+            username,
+            email,
+            password_hash,
+            is_admin: false,
+            avatar_url: None,
+            created_at,
+            totp_secret: None,
+            totp_enabled: false,
+            deactivated_at: None,
+        };
         Ok(UserObject::from(user))
     }
 
@@ -267,15 +303,30 @@ impl MutationRoot {
         let fingerprint = auth::ssh_key_fingerprint(public_key.trim())
             .map_err(|e| async_graphql::Error::new(format!("invalid SSH public key: {e}")))?;
 
-        let key = entity::ssh_key::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            user_id: Set(claims.sub),
-            title: Set(title),
-            public_key: Set(public_key),
-            fingerprint: Set(fingerprint),
-            created_at: Set(Utc::now()),
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        app.db
+            .execute(
+                "INSERT INTO ssh_keys (id, user_id, title, public_key, fingerprint, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params!(
+                    id.to_string(),
+                    claims.sub.to_string(),
+                    title.clone(),
+                    public_key.clone(),
+                    fingerprint.clone(),
+                    created_at.to_rfc3339()
+                ),
+            )
+            .await?;
+
+        let key = entity::ssh_key::Model {
+            id,
+            user_id: claims.sub,
+            title,
+            public_key,
+            fingerprint,
+            created_at,
         };
-        let key = key.insert(&app.db).await?;
         Ok(crate::types::SshKeyObject::from(key))
     }
 
@@ -285,12 +336,14 @@ impl MutationRoot {
         let claims = require_user(req)?;
         let app = ctx.data::<AppContext>()?;
 
-        let res = entity::prelude::SshKey::delete_many()
-            .filter(entity::ssh_key::Column::Id.eq(key_id))
-            .filter(entity::ssh_key::Column::UserId.eq(claims.sub))
-            .exec(&app.db)
+        let affected = app
+            .db
+            .execute(
+                "DELETE FROM ssh_keys WHERE id = ?1 AND user_id = ?2",
+                params!(key_id.to_string(), claims.sub.to_string()),
+            )
             .await?;
-        Ok(res.rows_affected > 0)
+        Ok(affected > 0)
     }
 
     async fn login(
@@ -301,10 +354,15 @@ impl MutationRoot {
         totp_code: Option<String>,
     ) -> async_graphql::Result<AuthPayload> {
         let app = ctx.data::<AppContext>()?;
-        let user = entity::prelude::User::find()
-            .filter(entity::user::Column::Username.eq(username))
-            .one(&app.db)
+        let user = app
+            .db
+            .query_as::<entity::user::Model, _>(
+                "SELECT * FROM users WHERE username = ?1",
+                params!(username),
+            )
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("invalid username or password"))?;
 
         if user.deactivated_at.is_some() {
@@ -349,18 +407,23 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let user = entity::prelude::User::find_by_id(claims.sub)
-            .one(&app.db)
+        let user = app
+            .db
+            .query_as::<entity::user::Model, _>("SELECT * FROM users WHERE id = ?1", params!(claims.sub.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("user not found"))?;
 
         let secret = auth::generate_totp_secret();
         let provisioning_uri = auth::totp_provisioning_uri(&secret, &user.username, TOTP_ISSUER);
 
-        let mut active: entity::user::ActiveModel = user.into();
-        active.totp_secret = Set(Some(secret.clone()));
-        active.totp_enabled = Set(false);
-        active.update(&app.db).await?;
+        app.db
+            .execute(
+                "UPDATE users SET totp_secret = ?1, totp_enabled = 0 WHERE id = ?2",
+                params!(secret.clone(), user.id.to_string()),
+            )
+            .await?;
 
         Ok(TwoFactorSetup {
             secret,
@@ -375,9 +438,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let user = entity::prelude::User::find_by_id(claims.sub)
-            .one(&app.db)
+        let user = app
+            .db
+            .query_as::<entity::user::Model, _>("SELECT * FROM users WHERE id = ?1", params!(claims.sub.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("user not found"))?;
 
         let secret = user
@@ -389,9 +455,12 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("totp_invalid"));
         }
 
-        let mut active: entity::user::ActiveModel = user.into();
-        active.totp_enabled = Set(true);
-        active.update(&app.db).await?;
+        app.db
+            .execute(
+                "UPDATE users SET totp_enabled = 1 WHERE id = ?1",
+                params!(user.id.to_string()),
+            )
+            .await?;
 
         Ok(true)
     }
@@ -402,15 +471,20 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let user = entity::prelude::User::find_by_id(claims.sub)
-            .one(&app.db)
+        let user = app
+            .db
+            .query_as::<entity::user::Model, _>("SELECT * FROM users WHERE id = ?1", params!(claims.sub.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("user not found"))?;
 
-        let mut active: entity::user::ActiveModel = user.into();
-        active.totp_enabled = Set(false);
-        active.totp_secret = Set(None);
-        active.update(&app.db).await?;
+        app.db
+            .execute(
+                "UPDATE users SET totp_enabled = 0, totp_secret = NULL WHERE id = ?1",
+                params!(user.id.to_string()),
+            )
+            .await?;
 
         Ok(true)
     }
@@ -430,14 +504,21 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let user = entity::prelude::User::find_by_id(user_id)
-            .one(&app.db)
+        let mut user = app
+            .db
+            .query_as::<entity::user::Model, _>("SELECT * FROM users WHERE id = ?1", params!(user_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("user not found"))?;
 
-        let mut active: entity::user::ActiveModel = user.into();
-        active.is_admin = Set(is_admin);
-        let user = active.update(&app.db).await?;
+        app.db
+            .execute(
+                "UPDATE users SET is_admin = ?1 WHERE id = ?2",
+                params!(is_admin, user_id.to_string()),
+            )
+            .await?;
+        user.is_admin = is_admin;
 
         Ok(UserObject::from(user))
     }
@@ -452,14 +533,22 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let user = entity::prelude::User::find_by_id(user_id)
-            .one(&app.db)
+        let mut user = app
+            .db
+            .query_as::<entity::user::Model, _>("SELECT * FROM users WHERE id = ?1", params!(user_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("user not found"))?;
 
-        let mut active: entity::user::ActiveModel = user.into();
-        active.deactivated_at = Set(Some(Utc::now()));
-        let user = active.update(&app.db).await?;
+        let deactivated_at = Utc::now();
+        app.db
+            .execute(
+                "UPDATE users SET deactivated_at = ?1 WHERE id = ?2",
+                params!(deactivated_at.to_rfc3339(), user_id.to_string()),
+            )
+            .await?;
+        user.deactivated_at = Some(deactivated_at);
 
         Ok(UserObject::from(user))
     }
@@ -477,9 +566,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let owner = entity::prelude::User::find_by_id(claims.sub)
-            .one(&app.db)
+        let owner = app
+            .db
+            .query_as::<entity::user::Model, _>("SELECT * FROM users WHERE id = ?1", params!(claims.sub.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("owner not found"))?;
 
         app.repo_manager
@@ -490,18 +582,36 @@ impl MutationRoot {
             tracing::warn!("failed to initialize wiki repo for {}/{name}: {e}", owner.username);
         }
 
-        let repo = entity::repository::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            owner_type: Set("user".to_string()),
-            owner_id: Set(owner.id),
-            name: Set(name),
-            description: Set(description),
-            is_private: Set(is_private),
-            default_branch: Set("main".to_string()),
-            forked_from_id: Set(None),
-            created_at: Set(Utc::now()),
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        let default_branch = "main".to_string();
+        app.db
+            .execute(
+                "INSERT INTO repositories (id, owner_type, owner_id, name, description, is_private, default_branch, created_at, forked_from_id) \
+                 VALUES (?1, 'user', ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+                params!(
+                    id.to_string(),
+                    owner.id.to_string(),
+                    name.clone(),
+                    description.clone(),
+                    is_private,
+                    default_branch.clone(),
+                    created_at.to_rfc3339()
+                ),
+            )
+            .await?;
+
+        let repo = entity::repository::Model {
+            id,
+            owner_type: "user".to_string(),
+            owner_id: owner.id,
+            name,
+            description,
+            is_private,
+            default_branch,
+            created_at,
+            forked_from_id: None,
         };
-        let repo = repo.insert(&app.db).await?;
 
         record_activity(
             app,
@@ -532,8 +642,8 @@ impl MutationRoot {
         let _ = app.repo_manager.delete_repo(&owner_login, &repo.name);
         let _ = app.repo_manager.delete_wiki(&owner_login, &repo.name);
 
-        entity::prelude::Repository::delete_by_id(repo.id)
-            .exec(&app.db)
+        app.db
+            .execute("DELETE FROM repositories WHERE id = ?1", params!(repo.id.to_string()))
             .await?;
 
         Ok(true)
@@ -555,23 +665,39 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let repo = find_repo(app, repo_id).await?;
+        let mut repo = find_repo(app, repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
         if perm != Some(Permission::Admin) {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let mut active: entity::repository::ActiveModel = repo.into();
         if let Some(description) = description {
-            active.description = Set(Some(description));
+            app.db
+                .execute(
+                    "UPDATE repositories SET description = ?1 WHERE id = ?2",
+                    params!(description.clone(), repo_id.to_string()),
+                )
+                .await?;
+            repo.description = Some(description);
         }
         if let Some(is_private) = is_private {
-            active.is_private = Set(is_private);
+            app.db
+                .execute(
+                    "UPDATE repositories SET is_private = ?1 WHERE id = ?2",
+                    params!(is_private, repo_id.to_string()),
+                )
+                .await?;
+            repo.is_private = is_private;
         }
         if let Some(default_branch) = default_branch {
-            active.default_branch = Set(default_branch);
+            app.db
+                .execute(
+                    "UPDATE repositories SET default_branch = ?1 WHERE id = ?2",
+                    params!(default_branch.clone(), repo_id.to_string()),
+                )
+                .await?;
+            repo.default_branch = default_branch;
         }
-        let repo = active.update(&app.db).await?;
 
         Ok(RepositoryObject::from_model(&app.db, repo).await)
     }
@@ -590,17 +716,23 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let dest_owner = entity::prelude::User::find_by_id(claims.sub)
-            .one(&app.db)
+        let dest_owner = app
+            .db
+            .query_as::<entity::user::Model, _>("SELECT * FROM users WHERE id = ?1", params!(claims.sub.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("user not found"))?;
 
-        let existing = entity::prelude::Repository::find()
-            .filter(entity::repository::Column::OwnerType.eq("user"))
-            .filter(entity::repository::Column::OwnerId.eq(dest_owner.id))
-            .filter(entity::repository::Column::Name.eq(source_repo.name.clone()))
-            .one(&app.db)
-            .await?;
+        let existing = app
+            .db
+            .query_as::<entity::repository::Model, _>(
+                "SELECT * FROM repositories WHERE owner_type = 'user' AND owner_id = ?1 AND name = ?2",
+                params!(dest_owner.id.to_string(), source_repo.name.clone()),
+            )
+            .await?
+            .into_iter()
+            .next();
         if existing.is_some() {
             return Err(async_graphql::Error::new(format!(
                 "you already own a repository named '{}'",
@@ -617,18 +749,36 @@ impl MutationRoot {
             .fork_repo(&source_owner_login, &source_repo.name, &dest_owner.username, &source_repo.name)
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-        let repo = entity::repository::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            owner_type: Set("user".to_string()),
-            owner_id: Set(dest_owner.id),
-            name: Set(source_repo.name.clone()),
-            description: Set(source_repo.description.clone()),
-            is_private: Set(source_repo.is_private),
-            default_branch: Set(source_repo.default_branch.clone()),
-            created_at: Set(Utc::now()),
-            forked_from_id: Set(Some(source_repo.id)),
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        app.db
+            .execute(
+                "INSERT INTO repositories (id, owner_type, owner_id, name, description, is_private, default_branch, created_at, forked_from_id) \
+                 VALUES (?1, 'user', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params!(
+                    id.to_string(),
+                    dest_owner.id.to_string(),
+                    source_repo.name.clone(),
+                    source_repo.description.clone(),
+                    source_repo.is_private,
+                    source_repo.default_branch.clone(),
+                    created_at.to_rfc3339(),
+                    source_repo.id.to_string()
+                ),
+            )
+            .await?;
+
+        let repo = entity::repository::Model {
+            id,
+            owner_type: "user".to_string(),
+            owner_id: dest_owner.id,
+            name: source_repo.name.clone(),
+            description: source_repo.description.clone(),
+            is_private: source_repo.is_private,
+            default_branch: source_repo.default_branch.clone(),
+            created_at,
+            forked_from_id: Some(source_repo.id),
         };
-        let repo = repo.insert(&app.db).await?;
 
         record_activity(
             app,
@@ -659,25 +809,45 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let existing_count = entity::prelude::Issue::find()
-            .filter(entity::issue::Column::RepoId.eq(repo_id))
-            .all(&app.db)
+        let existing_count = app
+            .db
+            .query_as::<entity::issue::Model, _>("SELECT * FROM issues WHERE repo_id = ?1", params!(repo_id.to_string()))
             .await?
             .len();
 
-        let issue = entity::issue::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            repo_id: Set(repo_id),
-            number: Set(existing_count as i32 + 1),
-            title: Set(title),
-            body: Set(body),
-            author_id: Set(claims.sub),
-            state: Set(entity::issue::state::OPEN.to_string()),
-            created_at: Set(Utc::now()),
-            closed_at: Set(None),
-            milestone_id: Set(None),
+        let id = Uuid::new_v4();
+        let number = existing_count as i32 + 1;
+        let created_at = Utc::now();
+        let state = entity::issue::state::OPEN.to_string();
+        app.db
+            .execute(
+                "INSERT INTO issues (id, repo_id, number, title, body, author_id, state, created_at, closed_at, milestone_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL)",
+                params!(
+                    id.to_string(),
+                    repo_id.to_string(),
+                    number,
+                    title.clone(),
+                    body.clone(),
+                    claims.sub.to_string(),
+                    state.clone(),
+                    created_at.to_rfc3339()
+                ),
+            )
+            .await?;
+
+        let issue = entity::issue::Model {
+            id,
+            repo_id,
+            number,
+            title,
+            body,
+            author_id: claims.sub,
+            state,
+            created_at,
+            closed_at: None,
+            milestone_id: None,
         };
-        let issue = issue.insert(&app.db).await?;
 
         let payload = serde_json::json!({
             "action": "opened",
@@ -719,9 +889,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let issue = entity::prelude::Issue::find_by_id(issue_id)
-            .one(&app.db)
+        let mut issue = app
+            .db
+            .query_as::<entity::issue::Model, _>("SELECT * FROM issues WHERE id = ?1", params!(issue_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("issue not found"))?;
         let repo = find_repo(app, issue.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -739,19 +912,36 @@ impl MutationRoot {
         }
 
         let was_open = issue.state == entity::issue::state::OPEN;
-        let mut active: entity::issue::ActiveModel = issue.into();
         if let Some(title) = title {
-            active.title = Set(title);
+            app.db
+                .execute(
+                    "UPDATE issues SET title = ?1 WHERE id = ?2",
+                    params!(title.clone(), issue_id.to_string()),
+                )
+                .await?;
+            issue.title = title;
         }
         if let Some(body) = body {
-            active.body = Set(Some(body));
+            app.db
+                .execute(
+                    "UPDATE issues SET body = ?1 WHERE id = ?2",
+                    params!(body.clone(), issue_id.to_string()),
+                )
+                .await?;
+            issue.body = Some(body);
         }
         if let Some(state) = state {
             let now_closed = state == entity::issue::state::CLOSED;
-            active.closed_at = Set(if now_closed { Some(Utc::now()) } else { None });
-            active.state = Set(state);
+            let closed_at = if now_closed { Some(Utc::now()) } else { None };
+            app.db
+                .execute(
+                    "UPDATE issues SET state = ?1, closed_at = ?2 WHERE id = ?3",
+                    params!(state.clone(), closed_at.map(|c: chrono::DateTime<Utc>| c.to_rfc3339()), issue_id.to_string()),
+                )
+                .await?;
+            issue.state = state;
+            issue.closed_at = closed_at;
         }
-        let issue = active.update(&app.db).await?;
 
         let action = if issue.state == entity::issue::state::CLOSED && was_open {
             "closed"
@@ -785,9 +975,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let issue = entity::prelude::Issue::find_by_id(issue_id)
-            .one(&app.db)
+        let issue = app
+            .db
+            .query_as::<entity::issue::Model, _>("SELECT * FROM issues WHERE id = ?1", params!(issue_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("issue not found"))?;
         let repo = find_repo(app, issue.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -795,14 +988,22 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let comment = entity::issue_comment::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            issue_id: Set(issue_id),
-            author_id: Set(claims.sub),
-            body: Set(body),
-            created_at: Set(Utc::now()),
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        app.db
+            .execute(
+                "INSERT INTO issue_comments (id, issue_id, author_id, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!(id.to_string(), issue_id.to_string(), claims.sub.to_string(), body.clone(), created_at.to_rfc3339()),
+            )
+            .await?;
+
+        let comment = entity::issue_comment::Model {
+            id,
+            issue_id,
+            author_id: claims.sub,
+            body,
+            created_at,
         };
-        let comment = comment.insert(&app.db).await?;
 
         let payload = serde_json::json!({
             "action": "created",
@@ -849,26 +1050,51 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let existing_count = entity::prelude::PullRequest::find()
-            .filter(entity::pull_request::Column::RepoId.eq(repo_id))
-            .all(&app.db)
+        let existing_count = app
+            .db
+            .query_as::<entity::pull_request::Model, _>(
+                "SELECT * FROM pull_requests WHERE repo_id = ?1",
+                params!(repo_id.to_string()),
+            )
             .await?
             .len();
 
-        let pr = entity::pull_request::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            repo_id: Set(repo_id),
-            number: Set(existing_count as i32 + 1),
-            title: Set(title),
-            body: Set(body),
-            author_id: Set(claims.sub),
-            source_branch: Set(source_branch),
-            target_branch: Set(target_branch),
-            state: Set(entity::pull_request::state::OPEN.to_string()),
-            created_at: Set(Utc::now()),
-            merged_at: Set(None),
+        let id = Uuid::new_v4();
+        let number = existing_count as i32 + 1;
+        let created_at = Utc::now();
+        let state = entity::pull_request::state::OPEN.to_string();
+        app.db
+            .execute(
+                "INSERT INTO pull_requests (id, repo_id, number, title, body, author_id, source_branch, target_branch, state, created_at, merged_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
+                params!(
+                    id.to_string(),
+                    repo_id.to_string(),
+                    number,
+                    title.clone(),
+                    body.clone(),
+                    claims.sub.to_string(),
+                    source_branch.clone(),
+                    target_branch.clone(),
+                    state.clone(),
+                    created_at.to_rfc3339()
+                ),
+            )
+            .await?;
+
+        let pr = entity::pull_request::Model {
+            id,
+            repo_id,
+            number,
+            title,
+            body,
+            author_id: claims.sub,
+            source_branch,
+            target_branch,
+            state,
+            created_at,
+            merged_at: None,
         };
-        let pr = pr.insert(&app.db).await?;
 
         let payload = serde_json::json!({
             "action": "opened",
@@ -913,9 +1139,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let pr = entity::prelude::PullRequest::find_by_id(pr_id)
-            .one(&app.db)
+        let mut pr = app
+            .db
+            .query_as::<entity::pull_request::Model, _>("SELECT * FROM pull_requests WHERE id = ?1", params!(pr_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("pull request not found"))?;
         let repo = find_repo(app, pr.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -927,19 +1156,24 @@ impl MutationRoot {
         // the PR's target branch and requires a minimum number of approved
         // reviews, count the approved `pr_reviews` rows for this PR and
         // refuse to merge if the threshold isn't met.
-        let rules = entity::prelude::BranchProtectionRule::find()
-            .filter(entity::branch_protection_rule::Column::RepoId.eq(repo.id))
-            .all(&app.db)
+        let rules = app
+            .db
+            .query_as::<entity::branch_protection_rule::Model, _>(
+                "SELECT * FROM branch_protection_rules WHERE repo_id = ?1",
+                params!(repo.id.to_string()),
+            )
             .await?;
         let matching_rule = rules.into_iter().find(|r| {
             entity::branch_protection_rule::branch_matches_pattern(&r.branch_pattern, &pr.target_branch)
         });
         if let Some(rule) = matching_rule {
             if rule.require_reviews_count > 0 {
-                let approved_count = entity::prelude::PrReview::find()
-                    .filter(entity::pr_review::Column::PrId.eq(pr.id))
-                    .filter(entity::pr_review::Column::State.eq(entity::pr_review::state::APPROVED))
-                    .all(&app.db)
+                let approved_count = app
+                    .db
+                    .query_as::<entity::pr_review::Model, _>(
+                        "SELECT * FROM pr_reviews WHERE pr_id = ?1 AND state = ?2",
+                        params!(pr.id.to_string(), entity::pr_review::state::APPROVED),
+                    )
                     .await?
                     .len() as i32;
                 if approved_count < rule.require_reviews_count {
@@ -1007,10 +1241,16 @@ impl MutationRoot {
             Err(e) => return Err(async_graphql::Error::new(e.to_string())),
         }
 
-        let mut active: entity::pull_request::ActiveModel = pr.into();
-        active.state = Set(entity::pull_request::state::MERGED.to_string());
-        active.merged_at = Set(Some(Utc::now()));
-        let pr = active.update(&app.db).await?;
+        let state = entity::pull_request::state::MERGED.to_string();
+        let merged_at = Utc::now();
+        app.db
+            .execute(
+                "UPDATE pull_requests SET state = ?1, merged_at = ?2 WHERE id = ?3",
+                params!(state.clone(), merged_at.to_rfc3339(), pr.id.to_string()),
+            )
+            .await?;
+        pr.state = state;
+        pr.merged_at = Some(merged_at);
 
         let payload = serde_json::json!({
             "action": "closed",
@@ -1059,9 +1299,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let pr = entity::prelude::PullRequest::find_by_id(pr_id)
-            .one(&app.db)
+        let mut pr = app
+            .db
+            .query_as::<entity::pull_request::Model, _>("SELECT * FROM pull_requests WHERE id = ?1", params!(pr_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("pull request not found"))?;
         let repo = find_repo(app, pr.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -1075,9 +1318,14 @@ impl MutationRoot {
             )));
         }
 
-        let mut active: entity::pull_request::ActiveModel = pr.into();
-        active.state = Set(entity::pull_request::state::CLOSED.to_string());
-        let pr = active.update(&app.db).await?;
+        let state = entity::pull_request::state::CLOSED.to_string();
+        app.db
+            .execute(
+                "UPDATE pull_requests SET state = ?1 WHERE id = ?2",
+                params!(state.clone(), pr.id.to_string()),
+            )
+            .await?;
+        pr.state = state;
 
         let payload = serde_json::json!({
             "action": "closed",
@@ -1171,16 +1419,32 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let rule = entity::branch_protection_rule::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            repo_id: Set(repo_id),
-            branch_pattern: Set(branch_pattern),
-            require_reviews_count: Set(require_reviews_count),
-            require_status_checks: Set(false),
-            block_force_push: Set(block_force_push),
-            created_at: Set(Utc::now()),
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        app.db
+            .execute(
+                "INSERT INTO branch_protection_rules (id, repo_id, branch_pattern, require_reviews_count, require_status_checks, block_force_push, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+                params!(
+                    id.to_string(),
+                    repo_id.to_string(),
+                    branch_pattern.clone(),
+                    require_reviews_count,
+                    block_force_push,
+                    created_at.to_rfc3339()
+                ),
+            )
+            .await?;
+
+        let rule = entity::branch_protection_rule::Model {
+            id,
+            repo_id,
+            branch_pattern,
+            require_reviews_count,
+            require_status_checks: false,
+            block_force_push,
+            created_at,
         };
-        let rule = rule.insert(&app.db).await?;
 
         Ok(BranchProtectionRuleObject::from(rule))
     }
@@ -1200,9 +1464,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let pr = entity::prelude::PullRequest::find_by_id(pr_id)
-            .one(&app.db)
+        let pr = app
+            .db
+            .query_as::<entity::pull_request::Model, _>("SELECT * FROM pull_requests WHERE id = ?1", params!(pr_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("pull request not found"))?;
         let repo = find_repo(app, pr.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -1221,15 +1488,23 @@ impl MutationRoot {
             )));
         }
 
-        let review = entity::pr_review::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            pr_id: Set(pr_id),
-            reviewer_id: Set(claims.sub),
-            state: Set(state),
-            body: Set(body),
-            created_at: Set(Utc::now()),
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        app.db
+            .execute(
+                "INSERT INTO pr_reviews (id, pr_id, reviewer_id, state, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params!(id.to_string(), pr_id.to_string(), claims.sub.to_string(), state.clone(), body.clone(), created_at.to_rfc3339()),
+            )
+            .await?;
+
+        let review = entity::pr_review::Model {
+            id,
+            pr_id,
+            reviewer_id: claims.sub,
+            state,
+            body,
+            created_at,
         };
-        let review = review.insert(&app.db).await?;
 
         Ok(PrReviewObject::from(review))
     }
@@ -1248,13 +1523,22 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let review = entity::prelude::PrReview::find_by_id(review_id)
-            .one(&app.db)
+        let review = app
+            .db
+            .query_as::<entity::pr_review::Model, _>("SELECT * FROM pr_reviews WHERE id = ?1", params!(review_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("review not found"))?;
-        let pr = entity::prelude::PullRequest::find_by_id(review.pr_id)
-            .one(&app.db)
+        let pr = app
+            .db
+            .query_as::<entity::pull_request::Model, _>(
+                "SELECT * FROM pull_requests WHERE id = ?1",
+                params!(review.pr_id.to_string()),
+            )
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("pull request not found"))?;
         let repo = find_repo(app, pr.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -1262,15 +1546,23 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let comment = entity::pr_review_comment::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            review_id: Set(review_id),
-            file_path: Set(file_path),
-            line_number: Set(line_number),
-            body: Set(body),
-            created_at: Set(Utc::now()),
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        app.db
+            .execute(
+                "INSERT INTO pr_review_comments (id, review_id, file_path, line_number, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params!(id.to_string(), review_id.to_string(), file_path.clone(), line_number, body.clone(), created_at.to_rfc3339()),
+            )
+            .await?;
+
+        let comment = entity::pr_review_comment::Model {
+            id,
+            review_id,
+            file_path,
+            line_number,
+            body,
+            created_at,
         };
-        let comment = comment.insert(&app.db).await?;
 
         Ok(PrReviewCommentObject::from(comment))
     }
@@ -1287,20 +1579,28 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let org = entity::organization::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            name: Set(name),
-            description: Set(description),
-            created_at: Set(Utc::now()),
-        };
-        let org = org.insert(&app.db).await?;
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        app.db
+            .execute(
+                "INSERT INTO organizations (id, name, description, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params!(id.to_string(), name.clone(), description.clone(), created_at.to_rfc3339()),
+            )
+            .await?;
 
-        let member = entity::org_member::ActiveModel {
-            org_id: Set(org.id),
-            user_id: Set(claims.sub),
-            role: Set(entity::org_member::role::OWNER.to_string()),
+        let org = entity::organization::Model {
+            id,
+            name,
+            description,
+            created_at,
         };
-        member.insert(&app.db).await?;
+
+        app.db
+            .execute(
+                "INSERT INTO org_members (org_id, user_id, role) VALUES (?1, ?2, ?3)",
+                params!(org.id.to_string(), claims.sub.to_string(), entity::org_member::role::OWNER),
+            )
+            .await?;
 
         Ok(OrganizationObject::from(org))
     }
@@ -1331,18 +1631,23 @@ impl MutationRoot {
             )));
         }
 
-        let user = entity::prelude::User::find()
-            .filter(entity::user::Column::Username.eq(username))
-            .one(&app.db)
+        let user = app
+            .db
+            .query_as::<entity::user::Model, _>(
+                "SELECT * FROM users WHERE username = ?1",
+                params!(username),
+            )
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("user not found"))?;
 
-        let member = entity::org_member::ActiveModel {
-            org_id: Set(org_id),
-            user_id: Set(user.id),
-            role: Set(role),
-        };
-        member.insert(&app.db).await?;
+        app.db
+            .execute(
+                "INSERT INTO org_members (org_id, user_id, role) VALUES (?1, ?2, ?3)",
+                params!(org_id.to_string(), user.id.to_string(), role),
+            )
+            .await?;
         Ok(true)
     }
 
@@ -1371,16 +1676,24 @@ impl MutationRoot {
             )));
         }
 
-        let member = entity::prelude::OrgMember::find()
-            .filter(entity::org_member::Column::OrgId.eq(org_id))
-            .filter(entity::org_member::Column::UserId.eq(user_id))
-            .one(&app.db)
+        let existing = app
+            .db
+            .query_as::<entity::org_member::Model, _>(
+                "SELECT * FROM org_members WHERE org_id = ?1 AND user_id = ?2",
+                params!(org_id.to_string(), user_id.to_string()),
+            )
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("member not found"))?;
+        let _ = existing;
 
-        let mut active: entity::org_member::ActiveModel = member.into();
-        active.role = Set(role);
-        active.update(&app.db).await?;
+        app.db
+            .execute(
+                "UPDATE org_members SET role = ?1 WHERE org_id = ?2 AND user_id = ?3",
+                params!(role, org_id.to_string(), user_id.to_string()),
+            )
+            .await?;
         Ok(true)
     }
 
@@ -1397,12 +1710,14 @@ impl MutationRoot {
         let claims = require_user(req)?;
         require_org_admin(app, org_id, claims.sub).await?;
 
-        let res = entity::prelude::OrgMember::delete_many()
-            .filter(entity::org_member::Column::OrgId.eq(org_id))
-            .filter(entity::org_member::Column::UserId.eq(user_id))
-            .exec(&app.db)
+        let affected = app
+            .db
+            .execute(
+                "DELETE FROM org_members WHERE org_id = ?1 AND user_id = ?2",
+                params!(org_id.to_string(), user_id.to_string()),
+            )
             .await?;
-        Ok(res.rows_affected > 0)
+        Ok(affected > 0)
     }
 
     /// Deletes an organization (and, via foreign-key cascade at the DB
@@ -1415,23 +1730,26 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let is_owner = entity::prelude::OrgMember::find()
-            .filter(entity::org_member::Column::OrgId.eq(org_id))
-            .filter(entity::org_member::Column::UserId.eq(claims.sub))
-            .one(&app.db)
+        let is_owner = app
+            .db
+            .query_as::<entity::org_member::Model, _>(
+                "SELECT * FROM org_members WHERE org_id = ?1 AND user_id = ?2",
+                params!(org_id.to_string(), claims.sub.to_string()),
+            )
             .await?
+            .into_iter()
+            .next()
             .map(|m| m.role == entity::org_member::role::OWNER)
             .unwrap_or(false);
         if !is_owner {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        entity::prelude::OrgMember::delete_many()
-            .filter(entity::org_member::Column::OrgId.eq(org_id))
-            .exec(&app.db)
+        app.db
+            .execute("DELETE FROM org_members WHERE org_id = ?1", params!(org_id.to_string()))
             .await?;
-        entity::prelude::Organization::delete_by_id(org_id)
-            .exec(&app.db)
+        app.db
+            .execute("DELETE FROM organizations WHERE id = ?1", params!(org_id.to_string()))
             .await?;
         Ok(true)
     }
@@ -1453,18 +1771,23 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let collaborator = entity::prelude::User::find()
-            .filter(entity::user::Column::Username.eq(username))
-            .one(&app.db)
+        let collaborator = app
+            .db
+            .query_as::<entity::user::Model, _>(
+                "SELECT * FROM users WHERE username = ?1",
+                params!(username),
+            )
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("user not found"))?;
 
-        let collab = entity::repo_collaborator::ActiveModel {
-            repo_id: Set(repo_id),
-            user_id: Set(collaborator.id),
-            permission: Set(permission),
-        };
-        collab.insert(&app.db).await?;
+        app.db
+            .execute(
+                "INSERT INTO repo_collaborators (repo_id, user_id, permission) VALUES (?1, ?2, ?3)",
+                params!(repo_id.to_string(), collaborator.id.to_string(), permission),
+            )
+            .await?;
 
         Ok(true)
     }
@@ -1488,12 +1811,14 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let res = entity::prelude::RepoCollaborator::delete_many()
-            .filter(entity::repo_collaborator::Column::RepoId.eq(repo_id))
-            .filter(entity::repo_collaborator::Column::UserId.eq(user_id))
-            .exec(&app.db)
+        let affected = app
+            .db
+            .execute(
+                "DELETE FROM repo_collaborators WHERE repo_id = ?1 AND user_id = ?2",
+                params!(repo_id.to_string(), user_id.to_string()),
+            )
             .await?;
-        Ok(res.rows_affected > 0)
+        Ok(affected > 0)
     }
 
     /// Loads a workflow definition from the repository's default branch,
@@ -1543,17 +1868,35 @@ impl MutationRoot {
             .map(|c| c.sha.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        let run = entity::workflow_run::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            repo_id: Set(repo_id),
-            workflow_name: Set(workflow.name.clone().unwrap_or_else(|| workflow_path.clone())),
-            commit_sha: Set(commit_sha),
-            event: Set("workflow_dispatch".to_string()),
-            status: Set(entity::workflow_run::status::QUEUED.to_string()),
-            started_at: Set(None),
-            finished_at: Set(None),
+        let id = Uuid::new_v4();
+        let workflow_name = workflow.name.clone().unwrap_or_else(|| workflow_path.clone());
+        let event = "workflow_dispatch".to_string();
+        let status = entity::workflow_run::status::QUEUED.to_string();
+        app.db
+            .execute(
+                "INSERT INTO workflow_runs (id, repo_id, workflow_name, commit_sha, event, status, started_at, finished_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
+                params!(
+                    id.to_string(),
+                    repo_id.to_string(),
+                    workflow_name.clone(),
+                    commit_sha.clone(),
+                    event.clone(),
+                    status.clone()
+                ),
+            )
+            .await?;
+
+        let run = entity::workflow_run::Model {
+            id,
+            repo_id,
+            workflow_name,
+            commit_sha,
+            event,
+            status,
+            started_at: None,
+            finished_at: None,
         };
-        let run = run.insert(&app.db).await?;
 
         // Spawn execution of every job in the background; this is fire-and-forget
         // since GraphQL mutations should return promptly. Job/run status updates
@@ -1573,16 +1916,23 @@ impl MutationRoot {
                 match result {
                     Ok(job_result) => {
                         for artifact in &job_result.artifacts {
-                            let row = entity::workflow_artifact::ActiveModel {
-                                id: Set(Uuid::new_v4()),
-                                run_id: Set(run_id),
-                                job_id: Set(None),
-                                name: Set(artifact.name.clone()),
-                                file_path: Set(artifact.file_path.clone()),
-                                size_bytes: Set(artifact.size_bytes),
-                                created_at: Set(Utc::now()),
-                            };
-                            if let Err(e) = row.insert(&db).await {
+                            let artifact_id = Uuid::new_v4();
+                            let created_at = Utc::now();
+                            let res = db
+                                .execute(
+                                    "INSERT INTO workflow_artifacts (id, run_id, job_id, name, file_path, size_bytes, created_at) \
+                                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)",
+                                    params!(
+                                        artifact_id.to_string(),
+                                        run_id.to_string(),
+                                        artifact.name.clone(),
+                                        artifact.file_path.clone(),
+                                        artifact.size_bytes,
+                                        created_at.to_rfc3339()
+                                    ),
+                                )
+                                .await;
+                            if let Err(e) = res {
                                 tracing::warn!("failed to insert workflow_artifact: {e}");
                             }
                         }
@@ -1637,19 +1987,42 @@ impl MutationRoot {
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-        let workspace = entity::dev_workspace::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            owner_id: Set(claims.sub),
-            repo_id: Set(repo_id),
-            name: Set(name),
-            image: Set(image),
-            status: Set(entity::dev_workspace::status::RUNNING.to_string()),
-            container_id: Set(Some(handle.container_id)),
-            created_at: Set(Utc::now()),
-            auto_stop_minutes: Set(auto_stop_minutes),
-            last_activity_at: Set(Some(Utc::now())),
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        let status = entity::dev_workspace::status::RUNNING.to_string();
+        let container_id = Some(handle.container_id);
+        let last_activity_at = Some(Utc::now());
+        app.db
+            .execute(
+                "INSERT INTO dev_workspaces (id, owner_id, repo_id, name, image, status, container_id, created_at, auto_stop_minutes, last_activity_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params!(
+                    id.to_string(),
+                    claims.sub.to_string(),
+                    repo_id.map(|r| r.to_string()),
+                    name.clone(),
+                    image.clone(),
+                    status.clone(),
+                    container_id.clone(),
+                    created_at.to_rfc3339(),
+                    auto_stop_minutes,
+                    last_activity_at.map(|t: chrono::DateTime<Utc>| t.to_rfc3339())
+                ),
+            )
+            .await?;
+
+        let workspace = entity::dev_workspace::Model {
+            id,
+            owner_id: claims.sub,
+            repo_id,
+            name,
+            image,
+            status,
+            container_id,
+            created_at,
+            auto_stop_minutes,
+            last_activity_at,
         };
-        let workspace = workspace.insert(&app.db).await?;
         Ok(DevWorkspaceObject::from(workspace))
     }
 
@@ -1658,9 +2031,15 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let workspace = entity::prelude::DevWorkspace::find_by_id(workspace_id)
-            .one(&app.db)
+        let mut workspace = app
+            .db
+            .query_as::<entity::dev_workspace::Model, _>(
+                "SELECT * FROM dev_workspaces WHERE id = ?1",
+                params!(workspace_id.to_string()),
+            )
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("workspace not found"))?;
         if workspace.owner_id != claims.sub {
             return Err(async_graphql::Error::new("forbidden"));
@@ -1675,9 +2054,14 @@ impl MutationRoot {
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-        let mut active: entity::dev_workspace::ActiveModel = workspace.into();
-        active.status = Set(entity::dev_workspace::status::RUNNING.to_string());
-        let workspace = active.update(&app.db).await?;
+        let status = entity::dev_workspace::status::RUNNING.to_string();
+        app.db
+            .execute(
+                "UPDATE dev_workspaces SET status = ?1 WHERE id = ?2",
+                params!(status.clone(), workspace_id.to_string()),
+            )
+            .await?;
+        workspace.status = status;
         Ok(DevWorkspaceObject::from(workspace))
     }
 
@@ -1686,9 +2070,15 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let workspace = entity::prelude::DevWorkspace::find_by_id(workspace_id)
-            .one(&app.db)
+        let mut workspace = app
+            .db
+            .query_as::<entity::dev_workspace::Model, _>(
+                "SELECT * FROM dev_workspaces WHERE id = ?1",
+                params!(workspace_id.to_string()),
+            )
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("workspace not found"))?;
         if workspace.owner_id != claims.sub {
             return Err(async_graphql::Error::new("forbidden"));
@@ -1703,9 +2093,14 @@ impl MutationRoot {
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-        let mut active: entity::dev_workspace::ActiveModel = workspace.into();
-        active.status = Set(entity::dev_workspace::status::STOPPED.to_string());
-        let workspace = active.update(&app.db).await?;
+        let status = entity::dev_workspace::status::STOPPED.to_string();
+        app.db
+            .execute(
+                "UPDATE dev_workspaces SET status = ?1 WHERE id = ?2",
+                params!(status.clone(), workspace_id.to_string()),
+            )
+            .await?;
+        workspace.status = status;
         Ok(DevWorkspaceObject::from(workspace))
     }
 
@@ -1714,9 +2109,15 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let workspace = entity::prelude::DevWorkspace::find_by_id(workspace_id)
-            .one(&app.db)
+        let workspace = app
+            .db
+            .query_as::<entity::dev_workspace::Model, _>(
+                "SELECT * FROM dev_workspaces WHERE id = ?1",
+                params!(workspace_id.to_string()),
+            )
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("workspace not found"))?;
         if workspace.owner_id != claims.sub {
             return Err(async_graphql::Error::new("forbidden"));
@@ -1729,8 +2130,8 @@ impl MutationRoot {
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         }
 
-        entity::prelude::DevWorkspace::delete_by_id(workspace.id)
-            .exec(&app.db)
+        app.db
+            .execute("DELETE FROM dev_workspaces WHERE id = ?1", params!(workspace.id.to_string()))
             .await?;
         Ok(true)
     }
@@ -1754,13 +2155,20 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let label = entity::label::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            repo_id: Set(repo_id),
-            name: Set(name),
-            color: Set(color),
+        let id = Uuid::new_v4();
+        app.db
+            .execute(
+                "INSERT INTO labels (id, repo_id, name, color) VALUES (?1, ?2, ?3, ?4)",
+                params!(id.to_string(), repo_id.to_string(), name.clone(), color.clone()),
+            )
+            .await?;
+
+        let label = entity::label::Model {
+            id,
+            repo_id,
+            name,
+            color,
         };
-        let label = label.insert(&app.db).await?;
         Ok(LabelObject::from(label))
     }
 
@@ -1774,9 +2182,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let issue = entity::prelude::Issue::find_by_id(issue_id)
-            .one(&app.db)
+        let issue = app
+            .db
+            .query_as::<entity::issue::Model, _>("SELECT * FROM issues WHERE id = ?1", params!(issue_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("issue not found"))?;
         let repo = find_repo(app, issue.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -1784,25 +2195,33 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let label = entity::prelude::Label::find_by_id(label_id)
-            .one(&app.db)
+        let label = app
+            .db
+            .query_as::<entity::label::Model, _>("SELECT * FROM labels WHERE id = ?1", params!(label_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("label not found"))?;
         if label.repo_id != repo.id {
             return Err(async_graphql::Error::new("label does not belong to this repository"));
         }
 
-        let existing = entity::prelude::IssueLabel::find()
-            .filter(entity::issue_label::Column::IssueId.eq(issue_id))
-            .filter(entity::issue_label::Column::LabelId.eq(label_id))
-            .one(&app.db)
-            .await?;
+        let existing = app
+            .db
+            .query_as::<entity::issue_label::Model, _>(
+                "SELECT * FROM issue_labels WHERE issue_id = ?1 AND label_id = ?2",
+                params!(issue_id.to_string(), label_id.to_string()),
+            )
+            .await?
+            .into_iter()
+            .next();
         if existing.is_none() {
-            let link = entity::issue_label::ActiveModel {
-                issue_id: Set(issue_id),
-                label_id: Set(label_id),
-            };
-            link.insert(&app.db).await?;
+            app.db
+                .execute(
+                    "INSERT INTO issue_labels (issue_id, label_id) VALUES (?1, ?2)",
+                    params!(issue_id.to_string(), label_id.to_string()),
+                )
+                .await?;
         }
 
         Ok(IssueObject::from(issue))
@@ -1818,9 +2237,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let issue = entity::prelude::Issue::find_by_id(issue_id)
-            .one(&app.db)
+        let issue = app
+            .db
+            .query_as::<entity::issue::Model, _>("SELECT * FROM issues WHERE id = ?1", params!(issue_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("issue not found"))?;
         let repo = find_repo(app, issue.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -1828,10 +2250,11 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        entity::prelude::IssueLabel::delete_many()
-            .filter(entity::issue_label::Column::IssueId.eq(issue_id))
-            .filter(entity::issue_label::Column::LabelId.eq(label_id))
-            .exec(&app.db)
+        app.db
+            .execute(
+                "DELETE FROM issue_labels WHERE issue_id = ?1 AND label_id = ?2",
+                params!(issue_id.to_string(), label_id.to_string()),
+            )
             .await?;
 
         Ok(IssueObject::from(issue))
@@ -1857,16 +2280,33 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let milestone = entity::milestone::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            repo_id: Set(repo_id),
-            title: Set(title),
-            description: Set(description),
-            due_date: Set(due_date),
-            state: Set(entity::milestone::state::OPEN.to_string()),
-            created_at: Set(Utc::now()),
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        let state = entity::milestone::state::OPEN.to_string();
+        app.db
+            .execute(
+                "INSERT INTO milestones (id, repo_id, title, description, due_date, state, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params!(
+                    id.to_string(),
+                    repo_id.to_string(),
+                    title.clone(),
+                    description.clone(),
+                    due_date.map(|d| d.to_rfc3339()),
+                    state.clone(),
+                    created_at.to_rfc3339()
+                ),
+            )
+            .await?;
+
+        let milestone = entity::milestone::Model {
+            id,
+            repo_id,
+            title,
+            description,
+            due_date,
+            state,
+            created_at,
         };
-        let milestone = milestone.insert(&app.db).await?;
         Ok(MilestoneObject::from(milestone))
     }
 
@@ -1880,9 +2320,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let issue = entity::prelude::Issue::find_by_id(issue_id)
-            .one(&app.db)
+        let mut issue = app
+            .db
+            .query_as::<entity::issue::Model, _>("SELECT * FROM issues WHERE id = ?1", params!(issue_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("issue not found"))?;
         let repo = find_repo(app, issue.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -1891,9 +2334,12 @@ impl MutationRoot {
         }
 
         if let Some(mid) = milestone_id {
-            let milestone = entity::prelude::Milestone::find_by_id(mid)
-                .one(&app.db)
+            let milestone = app
+                .db
+                .query_as::<entity::milestone::Model, _>("SELECT * FROM milestones WHERE id = ?1", params!(mid.to_string()))
                 .await?
+                .into_iter()
+                .next()
                 .ok_or_else(|| async_graphql::Error::new("milestone not found"))?;
             if milestone.repo_id != repo.id {
                 return Err(async_graphql::Error::new(
@@ -1902,9 +2348,13 @@ impl MutationRoot {
             }
         }
 
-        let mut active: entity::issue::ActiveModel = issue.into();
-        active.milestone_id = Set(milestone_id);
-        let issue = active.update(&app.db).await?;
+        app.db
+            .execute(
+                "UPDATE issues SET milestone_id = ?1 WHERE id = ?2",
+                params!(milestone_id.map(|m| m.to_string()), issue_id.to_string()),
+            )
+            .await?;
+        issue.milestone_id = milestone_id;
 
         Ok(IssueObject::from(issue))
     }
@@ -1927,13 +2377,21 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let project = entity::project::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            repo_id: Set(repo_id),
-            name: Set(name),
-            created_at: Set(Utc::now()),
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        app.db
+            .execute(
+                "INSERT INTO projects (id, repo_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params!(id.to_string(), repo_id.to_string(), name.clone(), created_at.to_rfc3339()),
+            )
+            .await?;
+
+        let project = entity::project::Model {
+            id,
+            repo_id,
+            name,
+            created_at,
         };
-        let project = project.insert(&app.db).await?;
         Ok(ProjectObject::from(project))
     }
 
@@ -1948,9 +2406,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let project = entity::prelude::Project::find_by_id(project_id)
-            .one(&app.db)
+        let project = app
+            .db
+            .query_as::<entity::project::Model, _>("SELECT * FROM projects WHERE id = ?1", params!(project_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("project not found"))?;
         let repo = find_repo(app, project.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -1958,13 +2419,20 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let column = entity::project_column::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            project_id: Set(project_id),
-            name: Set(name),
-            position: Set(position),
+        let id = Uuid::new_v4();
+        app.db
+            .execute(
+                "INSERT INTO project_columns (id, project_id, name, position) VALUES (?1, ?2, ?3, ?4)",
+                params!(id.to_string(), project_id.to_string(), name.clone(), position),
+            )
+            .await?;
+
+        let column = entity::project_column::Model {
+            id,
+            project_id,
+            name,
+            position,
         };
-        let column = column.insert(&app.db).await?;
         Ok(ProjectColumnObject::from(column))
     }
 
@@ -1979,13 +2447,25 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let column = entity::prelude::ProjectColumn::find_by_id(column_id)
-            .one(&app.db)
+        let column = app
+            .db
+            .query_as::<entity::project_column::Model, _>(
+                "SELECT * FROM project_columns WHERE id = ?1",
+                params!(column_id.to_string()),
+            )
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("project column not found"))?;
-        let project = entity::prelude::Project::find_by_id(column.project_id)
-            .one(&app.db)
+        let project = app
+            .db
+            .query_as::<entity::project::Model, _>(
+                "SELECT * FROM projects WHERE id = ?1",
+                params!(column.project_id.to_string()),
+            )
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("project not found"))?;
         let repo = find_repo(app, project.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -1993,22 +2473,32 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let issue = entity::prelude::Issue::find_by_id(issue_id)
-            .one(&app.db)
+        let issue = app
+            .db
+            .query_as::<entity::issue::Model, _>("SELECT * FROM issues WHERE id = ?1", params!(issue_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("issue not found"))?;
         if issue.repo_id != repo.id {
             return Err(async_graphql::Error::new("issue does not belong to this repository"));
         }
 
-        let card = entity::project_card::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            column_id: Set(column_id),
-            issue_id: Set(Some(issue_id)),
-            pull_request_id: Set(None),
-            position: Set(position),
+        let id = Uuid::new_v4();
+        app.db
+            .execute(
+                "INSERT INTO project_cards (id, column_id, issue_id, pull_request_id, position) VALUES (?1, ?2, ?3, NULL, ?4)",
+                params!(id.to_string(), column_id.to_string(), issue_id.to_string(), position),
+            )
+            .await?;
+
+        let card = entity::project_card::Model {
+            id,
+            column_id,
+            issue_id: Some(issue_id),
+            pull_request_id: None,
+            position,
         };
-        let card = card.insert(&app.db).await?;
         Ok(ProjectCardObject::from(card))
     }
 
@@ -2020,17 +2510,28 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let notification = entity::prelude::Notification::find_by_id(id)
-            .one(&app.db)
+        let mut notification = app
+            .db
+            .query_as::<entity::notification::Model, _>(
+                "SELECT * FROM notifications WHERE id = ?1",
+                params!(id.to_string()),
+            )
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("notification not found"))?;
         if notification.user_id != claims.sub {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let mut active: entity::notification::ActiveModel = notification.into();
-        active.read_at = Set(Some(Utc::now()));
-        let notification = active.update(&app.db).await?;
+        let read_at = Utc::now();
+        app.db
+            .execute(
+                "UPDATE notifications SET read_at = ?1 WHERE id = ?2",
+                params!(read_at.to_rfc3339(), id.to_string()),
+            )
+            .await?;
+        notification.read_at = Some(read_at);
 
         Ok(NotificationObject::from(notification))
     }
@@ -2059,25 +2560,32 @@ impl MutationRoot {
         let key = secrets_encryption_key().map_err(|e| async_graphql::Error::new(e.to_string()))?;
         let encrypted_value = actions::encrypt_secret(&key, &value);
 
-        let existing = entity::prelude::RepoSecret::find()
-            .filter(entity::repo_secret::Column::RepoId.eq(repo_id))
-            .filter(entity::repo_secret::Column::Name.eq(name.clone()))
-            .one(&app.db)
-            .await?;
+        let existing = app
+            .db
+            .query_as::<entity::repo_secret::Model, _>(
+                "SELECT * FROM repo_secrets WHERE repo_id = ?1 AND name = ?2",
+                params!(repo_id.to_string(), name.clone()),
+            )
+            .await?
+            .into_iter()
+            .next();
 
         if let Some(existing) = existing {
-            let mut active: entity::repo_secret::ActiveModel = existing.into();
-            active.encrypted_value = Set(encrypted_value);
-            active.update(&app.db).await?;
+            app.db
+                .execute(
+                    "UPDATE repo_secrets SET encrypted_value = ?1 WHERE id = ?2",
+                    params!(encrypted_value, existing.id.to_string()),
+                )
+                .await?;
         } else {
-            let secret = entity::repo_secret::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                repo_id: Set(repo_id),
-                name: Set(name),
-                encrypted_value: Set(encrypted_value),
-                created_at: Set(Utc::now()),
-            };
-            secret.insert(&app.db).await?;
+            let id = Uuid::new_v4();
+            let created_at = Utc::now();
+            app.db
+                .execute(
+                    "INSERT INTO repo_secrets (id, repo_id, name, encrypted_value, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params!(id.to_string(), repo_id.to_string(), name, encrypted_value, created_at.to_rfc3339()),
+                )
+                .await?;
         }
 
         Ok(true)
@@ -2106,31 +2614,37 @@ impl MutationRoot {
 
         let sync_interval_minutes = sync_interval_minutes.unwrap_or(60);
 
-        let existing = entity::prelude::RepoMirror::find()
-            .filter(entity::repo_mirror::Column::RepoId.eq(repo_id))
-            .one(&app.db)
-            .await?;
+        let existing = app
+            .db
+            .query_as::<entity::repo_mirror::Model, _>(
+                "SELECT * FROM repo_mirrors WHERE repo_id = ?1",
+                params!(repo_id.to_string()),
+            )
+            .await?
+            .into_iter()
+            .next();
 
         if let Some(existing) = existing {
-            let mut active: entity::repo_mirror::ActiveModel = existing.into();
-            active.remote_url = Set(remote_url);
-            active.sync_interval_minutes = Set(sync_interval_minutes);
-            active.update(&app.db).await?;
+            app.db
+                .execute(
+                    "UPDATE repo_mirrors SET remote_url = ?1, sync_interval_minutes = ?2 WHERE id = ?3",
+                    params!(remote_url, sync_interval_minutes, existing.id.to_string()),
+                )
+                .await?;
         } else {
-            let mirror = entity::repo_mirror::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                repo_id: Set(repo_id),
-                remote_url: Set(remote_url),
-                last_synced_at: Set(None),
-                sync_interval_minutes: Set(sync_interval_minutes),
-                created_at: Set(Utc::now()),
-            };
-            mirror.insert(&app.db).await?;
+            let id = Uuid::new_v4();
+            let created_at = Utc::now();
+            app.db
+                .execute(
+                    "INSERT INTO repo_mirrors (id, repo_id, remote_url, last_synced_at, sync_interval_minutes, created_at) \
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
+                    params!(id.to_string(), repo_id.to_string(), remote_url, sync_interval_minutes, created_at.to_rfc3339()),
+                )
+                .await?;
         }
 
         Ok(true)
     }
-
 
     // ---- Personal access tokens ----
 
@@ -2154,15 +2668,30 @@ impl MutationRoot {
         let (token, token_hash) = auth::generate_access_token();
         let expires_at = expires_in_days.map(|days| Utc::now() + chrono::Duration::days(days));
 
-        let row = entity::access_token::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            user_id: Set(claims.sub),
-            token_hash: Set(token_hash),
-            name: Set(name),
-            scopes: Set(serde_json::to_value(&scopes).unwrap_or(serde_json::Value::Array(vec![]))),
-            expires_at: Set(expires_at),
+        let id = Uuid::new_v4();
+        let scopes_json = serde_json::to_string(&scopes).unwrap_or_else(|_| "[]".to_string());
+        app.db
+            .execute(
+                "INSERT INTO access_tokens (id, user_id, token_hash, name, scopes, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params!(
+                    id.to_string(),
+                    claims.sub.to_string(),
+                    token_hash.clone(),
+                    name.clone(),
+                    scopes_json.clone(),
+                    expires_at.map(|d| d.to_rfc3339())
+                ),
+            )
+            .await?;
+
+        let row = entity::access_token::Model {
+            id,
+            user_id: claims.sub,
+            token_hash,
+            name,
+            scopes: scopes_json,
+            expires_at,
         };
-        let row = row.insert(&app.db).await?;
 
         Ok(AccessTokenCreated {
             token,
@@ -2176,12 +2705,14 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let res = entity::prelude::AccessToken::delete_many()
-            .filter(entity::access_token::Column::Id.eq(id))
-            .filter(entity::access_token::Column::UserId.eq(claims.sub))
-            .exec(&app.db)
+        let affected = app
+            .db
+            .execute(
+                "DELETE FROM access_tokens WHERE id = ?1 AND user_id = ?2",
+                params!(id.to_string(), claims.sub.to_string()),
+            )
             .await?;
-        Ok(res.rows_affected > 0)
+        Ok(affected > 0)
     }
 
     // ---- Webhooks ----
@@ -2209,15 +2740,23 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let webhook = entity::webhook::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            repo_id: Set(repo_id),
-            target_url: Set(target_url),
-            secret: Set(secret),
-            events: Set(serde_json::to_value(&events).unwrap_or(serde_json::Value::Array(vec![]))),
-            active: Set(true),
+        let id = Uuid::new_v4();
+        let events_json = serde_json::to_string(&events).unwrap_or_else(|_| "[]".to_string());
+        app.db
+            .execute(
+                "INSERT INTO webhooks (id, repo_id, target_url, secret, events, active) VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                params!(id.to_string(), repo_id.to_string(), target_url.clone(), secret.clone(), events_json.clone()),
+            )
+            .await?;
+
+        let webhook = entity::webhook::Model {
+            id,
+            repo_id,
+            target_url,
+            secret,
+            events: events_json,
+            active: true,
         };
-        let webhook = webhook.insert(&app.db).await?;
         Ok(WebhookObject::from(webhook))
     }
 
@@ -2235,9 +2774,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let webhook = entity::prelude::Webhook::find_by_id(webhook_id)
-            .one(&app.db)
+        let mut webhook = app
+            .db
+            .query_as::<entity::webhook::Model, _>("SELECT * FROM webhooks WHERE id = ?1", params!(webhook_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("webhook not found"))?;
         let repo = find_repo(app, webhook.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -2245,18 +2787,34 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        let mut active_model: entity::webhook::ActiveModel = webhook.into();
         if let Some(target_url) = target_url {
-            active_model.target_url = Set(target_url);
+            app.db
+                .execute(
+                    "UPDATE webhooks SET target_url = ?1 WHERE id = ?2",
+                    params!(target_url.clone(), webhook_id.to_string()),
+                )
+                .await?;
+            webhook.target_url = target_url;
         }
         if let Some(events) = events {
-            active_model.events =
-                Set(serde_json::to_value(&events).unwrap_or(serde_json::Value::Array(vec![])));
+            let events_json = serde_json::to_string(&events).unwrap_or_else(|_| "[]".to_string());
+            app.db
+                .execute(
+                    "UPDATE webhooks SET events = ?1 WHERE id = ?2",
+                    params!(events_json.clone(), webhook_id.to_string()),
+                )
+                .await?;
+            webhook.events = events_json;
         }
         if let Some(active) = active {
-            active_model.active = Set(active);
+            app.db
+                .execute(
+                    "UPDATE webhooks SET active = ?1 WHERE id = ?2",
+                    params!(active, webhook_id.to_string()),
+                )
+                .await?;
+            webhook.active = active;
         }
-        let webhook = active_model.update(&app.db).await?;
         Ok(WebhookObject::from(webhook))
     }
 
@@ -2266,9 +2824,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let webhook = entity::prelude::Webhook::find_by_id(webhook_id)
-            .one(&app.db)
+        let webhook = app
+            .db
+            .query_as::<entity::webhook::Model, _>("SELECT * FROM webhooks WHERE id = ?1", params!(webhook_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("webhook not found"))?;
         let repo = find_repo(app, webhook.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -2276,8 +2837,8 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        entity::prelude::Webhook::delete_by_id(webhook_id)
-            .exec(&app.db)
+        app.db
+            .execute("DELETE FROM webhooks WHERE id = ?1", params!(webhook_id.to_string()))
             .await?;
         Ok(true)
     }
@@ -2292,9 +2853,12 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let label = entity::prelude::Label::find_by_id(label_id)
-            .one(&app.db)
+        let label = app
+            .db
+            .query_as::<entity::label::Model, _>("SELECT * FROM labels WHERE id = ?1", params!(label_id.to_string()))
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("label not found"))?;
         let repo = find_repo(app, label.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -2302,12 +2866,14 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        entity::prelude::IssueLabel::delete_many()
-            .filter(entity::issue_label::Column::LabelId.eq(label_id))
-            .exec(&app.db)
+        app.db
+            .execute(
+                "DELETE FROM issue_labels WHERE label_id = ?1",
+                params!(label_id.to_string()),
+            )
             .await?;
-        entity::prelude::Label::delete_by_id(label_id)
-            .exec(&app.db)
+        app.db
+            .execute("DELETE FROM labels WHERE id = ?1", params!(label_id.to_string()))
             .await?;
         Ok(true)
     }
@@ -2320,9 +2886,15 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let milestone = entity::prelude::Milestone::find_by_id(milestone_id)
-            .one(&app.db)
+        let milestone = app
+            .db
+            .query_as::<entity::milestone::Model, _>(
+                "SELECT * FROM milestones WHERE id = ?1",
+                params!(milestone_id.to_string()),
+            )
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("milestone not found"))?;
         let repo = find_repo(app, milestone.repo_id).await?;
         let perm = repo_permission(app, &repo, claims.sub).await?;
@@ -2330,13 +2902,14 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        entity::prelude::Issue::update_many()
-            .col_expr(entity::issue::Column::MilestoneId, Expr::value(None::<Uuid>))
-            .filter(entity::issue::Column::MilestoneId.eq(milestone_id))
-            .exec(&app.db)
+        app.db
+            .execute(
+                "UPDATE issues SET milestone_id = NULL WHERE milestone_id = ?1",
+                params!(milestone_id.to_string()),
+            )
             .await?;
-        entity::prelude::Milestone::delete_by_id(milestone_id)
-            .exec(&app.db)
+        app.db
+            .execute("DELETE FROM milestones WHERE id = ?1", params!(milestone_id.to_string()))
             .await?;
         Ok(true)
     }
@@ -2356,9 +2929,15 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let workspace = entity::prelude::DevWorkspace::find_by_id(workspace_id)
-            .one(&app.db)
+        let workspace = app
+            .db
+            .query_as::<entity::dev_workspace::Model, _>(
+                "SELECT * FROM dev_workspaces WHERE id = ?1",
+                params!(workspace_id.to_string()),
+            )
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| async_graphql::Error::new("workspace not found"))?;
         if workspace.owner_id != claims.sub && !claims.is_admin {
             return Err(async_graphql::Error::new("forbidden"));

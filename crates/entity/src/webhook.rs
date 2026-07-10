@@ -1,32 +1,18 @@
-use sea_orm::entity::prelude::*;
+//! `webhooks` table.
+//!
+//! `events` is stored as a `TEXT` column holding serialized JSON (was
+//! Postgres `JSONB`). Parse with `serde_json::from_str::<serde_json::Value>`
+//! and serialize with `serde_json::to_string` before binding as a param.
 
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, serde::Serialize, serde::Deserialize)]
-#[sea_orm(table_name = "webhooks")]
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
     pub repo_id: Uuid,
     pub target_url: String,
     pub secret: String,
-    pub events: Json,
-    #[sea_orm(default_value = true)]
+    pub events: String,
     pub active: bool,
 }
-
-#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {
-    #[sea_orm(
-        belongs_to = "super::repository::Entity",
-        from = "Column::RepoId",
-        to = "super::repository::Column::Id"
-    )]
-    Repository,
-}
-
-impl Related<super::repository::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Repository.def()
-    }
-}
-
-impl ActiveModelBehavior for ActiveModel {}

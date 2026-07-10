@@ -1,31 +1,19 @@
-use sea_orm::entity::prelude::*;
+//! `access_tokens` table.
+//!
+//! `scopes` is stored as a `TEXT` column holding serialized JSON (was
+//! Postgres `JSONB`). Parse with `serde_json::from_str::<serde_json::Value>`
+//! and serialize with `serde_json::to_string` before binding as a param.
 
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, serde::Serialize, serde::Deserialize)]
-#[sea_orm(table_name = "access_tokens")]
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
     pub user_id: Uuid,
     pub token_hash: String,
     pub name: String,
-    pub scopes: Json,
-    pub expires_at: Option<ChronoDateTimeUtc>,
+    pub scopes: String,
+    pub expires_at: Option<DateTime<Utc>>,
 }
-
-#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {
-    #[sea_orm(
-        belongs_to = "super::user::Entity",
-        from = "Column::UserId",
-        to = "super::user::Column::Id"
-    )]
-    User,
-}
-
-impl Related<super::user::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::User.def()
-    }
-}
-
-impl ActiveModelBehavior for ActiveModel {}

@@ -13,7 +13,6 @@ chrono.workspace = true
 serde.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
-sea-orm.workspace = true
 http = "1"
 async-trait = "0.1"
 sha2 = "0.10"

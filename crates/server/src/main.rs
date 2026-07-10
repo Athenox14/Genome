@@ -11,8 +11,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
-use migration::MigratorTrait;
-use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use hiqlite::params;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -33,18 +32,21 @@ struct ServerState {
 /// `Claims` of the user it belongs to, for `auth::extract_user_from_headers`.
 /// Expired tokens (`expires_at` in the past) are treated as invalid.
 struct DbTokenLookup {
-    db: DatabaseConnection,
+    db: hiqlite::Client,
 }
 
 #[async_trait::async_trait]
 impl auth::TokenLookup for DbTokenLookup {
     async fn lookup(&self, token_hash: &str) -> Option<auth::Claims> {
-        if let Some(token) = entity::prelude::AccessToken::find()
-            .filter(entity::access_token::Column::TokenHash.eq(token_hash))
-            .one(&self.db)
+        if let Some(token) = self
+            .db
+            .query_as::<entity::access_token::Model, _>(
+                "SELECT * FROM access_tokens WHERE token_hash = ?1",
+                params!(token_hash.to_string()),
+            )
             .await
             .ok()
-            .flatten()
+            .and_then(|rows| rows.into_iter().next())
         {
             if let Some(expires_at) = token.expires_at {
                 if expires_at < chrono::Utc::now() {
@@ -60,10 +62,16 @@ impl auth::TokenLookup for DbTokenLookup {
 
 impl DbTokenLookup {
     async fn claims_for_user(&self, user_id: Uuid) -> Option<auth::Claims> {
-        let user = entity::prelude::User::find_by_id(user_id)
-            .one(&self.db)
+        let user = self
+            .db
+            .query_as::<entity::user::Model, _>(
+                "SELECT * FROM users WHERE id = ?1",
+                params!(user_id.to_string()),
+            )
             .await
-            .ok()??;
+            .ok()?
+            .into_iter()
+            .next()?;
         if user.deactivated_at.is_some() {
             return None;
         }
@@ -98,8 +106,44 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
 
-    let db: DatabaseConnection = sea_orm::Database::connect(&config.database_url).await?;
-    migration::Migrator::up(&db, None).await?;
+    tokio::fs::create_dir_all(&config.data_dir).await?;
+
+    let secret_raft = hiqlite_secret(&config.jwt_secret, "raft");
+    let secret_api = hiqlite_secret(&config.jwt_secret, "api");
+    // Hiqlite always encrypts its Raft logs/snapshots at rest and requires a
+    // non-empty `enc_keys`, regardless of whether the `backup`/`s3`/`dashboard`
+    // features are enabled. Derive a stable 32-byte key from JWT_SECRET (same
+    // seed as secret_raft/secret_api) so it survives restarts -- a fresh
+    // random key every boot would make prior snapshots undecryptable.
+    let enc_key_bytes: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(format!("{}:hiqlite-enc-key", config.jwt_secret).as_bytes()).into()
+    };
+    let node_config = hiqlite::NodeConfig {
+        node_id: 1,
+        nodes: vec![hiqlite::Node {
+            id: 1,
+            addr_raft: config.hiqlite_raft_addr.clone(),
+            addr_api: config.hiqlite_api_addr.clone(),
+        }],
+        // `listen_addr_*` is just the bind HOST (no port) -- hiqlite derives
+        // the port to bind from the matching `Node.addr_*` entry above and
+        // appends it internally. Passing "host:port" here (as opposed to
+        // just "host") produces an invalid doubled "host:port:port" address.
+        listen_addr_api: "0.0.0.0".into(),
+        listen_addr_raft: "0.0.0.0".into(),
+        data_dir: config.data_dir.clone().into(),
+        filename_db: "genome.db".into(),
+        secret_raft,
+        secret_api,
+        enc_keys: cryptr::EncKeys {
+            enc_key_active: "k1".to_string(),
+            enc_keys: vec![("k1".to_string(), enc_key_bytes.to_vec())],
+        },
+        ..Default::default()
+    };
+    let db: hiqlite::Client = hiqlite::start_node(node_config).await?;
+    db.migrate::<migration::Migrations>().await?;
 
     let repo_manager = Arc::new(git_core::RepoManager::new(config.repos_root_path.clone()));
     let artifacts_root = std::path::Path::new(&config.repos_root_path)
@@ -365,10 +409,15 @@ async fn process_push_workflows(
 ) -> anyhow::Result<()> {
     const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 
-    let repo_row = entity::prelude::Repository::find()
-        .filter(entity::repository::Column::Name.eq(repo.clone()))
-        .one(&app_ctx.db)
-        .await?;
+    let repo_row = app_ctx
+        .db
+        .query_as::<entity::repository::Model, _>(
+            "SELECT * FROM repositories WHERE name = ?1",
+            params!(repo.clone()),
+        )
+        .await?
+        .into_iter()
+        .next();
 
     let Some(repo_row) = repo_row else {
         tracing::warn!("no repository row found for {owner}/{repo}; skipping workflow trigger");
@@ -395,15 +444,22 @@ async fn process_push_workflows(
         // user-owned repo (organization-owned pushes are skipped rather than
         // guessing at an actor).
         if repo_row.owner_type == "user" {
-            let event = entity::activity_event::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                repo_id: Set(Some(repo_row.id)),
-                actor_id: Set(repo_row.owner_id),
-                kind: Set(entity::activity_event::kind::PUSH.to_string()),
-                summary: Set(format!("push to {ref_name} on {owner}/{repo}")),
-                created_at: Set(chrono::Utc::now()),
-            };
-            if let Err(e) = event.insert(&app_ctx.db).await {
+            let res = app_ctx
+                .db
+                .execute(
+                    "INSERT INTO activity_events (id, repo_id, actor_id, kind, summary, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params!(
+                        Uuid::new_v4().to_string(),
+                        Some(repo_row.id.to_string()),
+                        repo_row.owner_id.to_string(),
+                        entity::activity_event::kind::PUSH.to_string(),
+                        format!("push to {ref_name} on {owner}/{repo}"),
+                        chrono::Utc::now().to_rfc3339()
+                    ),
+                )
+                .await;
+            if let Err(e) = res {
                 tracing::warn!("failed to insert activity event for push: {e}");
             }
         }
@@ -448,24 +504,38 @@ async fn process_push_workflows(
 
             let workflow_name = workflow.name.clone().unwrap_or_else(|| path.clone());
 
-            let run = entity::workflow_run::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                repo_id: Set(repo_row.id),
-                workflow_name: Set(workflow_name.clone()),
-                commit_sha: Set(new_sha.clone()),
-                event: Set("push".to_string()),
-                status: Set(entity::workflow_run::status::RUNNING.to_string()),
-                started_at: Set(Some(chrono::Utc::now())),
-                finished_at: Set(None),
+            let run_id = Uuid::new_v4();
+            let started_at = chrono::Utc::now();
+            let run_model = entity::workflow_run::Model {
+                id: run_id,
+                repo_id: repo_row.id,
+                workflow_name: workflow_name.clone(),
+                commit_sha: new_sha.clone(),
+                event: "push".to_string(),
+                status: entity::workflow_run::status::RUNNING.to_string(),
+                started_at: Some(started_at),
+                finished_at: None,
             };
-            let inserted = run.insert(&app_ctx.db).await;
-            let run_model = match inserted {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!("failed to record workflow_run: {e}");
-                    continue;
-                }
-            };
+            let inserted = app_ctx
+                .db
+                .execute(
+                    "INSERT INTO workflow_runs (id, repo_id, workflow_name, commit_sha, event, status, started_at, finished_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+                    params!(
+                        run_id.to_string(),
+                        repo_row.id.to_string(),
+                        workflow_name.clone(),
+                        new_sha.clone(),
+                        "push".to_string(),
+                        entity::workflow_run::status::RUNNING.to_string(),
+                        started_at.to_rfc3339()
+                    ),
+                )
+                .await;
+            if let Err(e) = inserted {
+                tracing::warn!("failed to record workflow_run: {e}");
+                continue;
+            }
 
             let archive = match app_ctx
                 .repo_manager
@@ -494,16 +564,22 @@ async fn process_push_workflows(
                 let status = match result {
                     Ok(job_result) => {
                         for artifact in &job_result.artifacts {
-                            let row = entity::workflow_artifact::ActiveModel {
-                                id: Set(Uuid::new_v4()),
-                                run_id: Set(run_model.id),
-                                job_id: Set(None),
-                                name: Set(artifact.name.clone()),
-                                file_path: Set(artifact.file_path.clone()),
-                                size_bytes: Set(artifact.size_bytes),
-                                created_at: Set(chrono::Utc::now()),
-                            };
-                            if let Err(e) = row.insert(&app_ctx.db).await {
+                            let res = app_ctx
+                                .db
+                                .execute(
+                                    "INSERT INTO workflow_artifacts (id, run_id, job_id, name, file_path, size_bytes, created_at) \
+                                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)",
+                                    params!(
+                                        Uuid::new_v4().to_string(),
+                                        run_model.id.to_string(),
+                                        artifact.name.clone(),
+                                        artifact.file_path.clone(),
+                                        artifact.size_bytes,
+                                        chrono::Utc::now().to_rfc3339()
+                                    ),
+                                )
+                                .await;
+                            if let Err(e) = res {
                                 tracing::warn!("failed to insert workflow_artifact: {e}");
                             }
                         }
@@ -518,10 +594,18 @@ async fn process_push_workflows(
                     }
                 };
 
-                let mut update: entity::workflow_run::ActiveModel = run_model.clone().into();
-                update.status = Set(status.to_string());
-                update.finished_at = Set(Some(chrono::Utc::now()));
-                if let Err(e) = update.update(&app_ctx.db).await {
+                let res = app_ctx
+                    .db
+                    .execute(
+                        "UPDATE workflow_runs SET status = ?1, finished_at = ?2 WHERE id = ?3",
+                        params!(
+                            status.to_string(),
+                            chrono::Utc::now().to_rfc3339(),
+                            run_model.id.to_string()
+                        ),
+                    )
+                    .await;
+                if let Err(e) = res {
                     tracing::warn!("failed to update workflow_run: {e}");
                 }
             }
@@ -600,14 +684,28 @@ async fn run_check_push_protection(args: &[String]) -> anyhow::Result<i32> {
 
     const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 
-    let database_url = std::env::var("DATABASE_URL")
-        .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable must be set"))?;
-    let db: DatabaseConnection = sea_orm::Database::connect(&database_url).await?;
-
-    let repo_row = entity::prelude::Repository::find()
-        .filter(entity::repository::Column::Name.eq(name.clone()))
-        .one(&db)
+    // The server binary (running as its own process, embedding the actual
+    // Hiqlite Raft node) is expected to already be running when a push
+    // happens; this CLI subcommand connects to it as a remote Hiqlite client
+    // rather than starting a second Raft node against the same data
+    // directory (which would conflict with the running node's port bindings
+    // and on-disk state).
+    let jwt_secret = std::env::var("JWT_SECRET")
+        .map_err(|_| anyhow::anyhow!("JWT_SECRET environment variable must be set"))?;
+    let api_addr =
+        std::env::var("HIQLITE_API_ADDR").unwrap_or_else(|_| "127.0.0.1:8200".to_string());
+    let secret_api = hiqlite_secret(&jwt_secret, "api");
+    let db = hiqlite::Client::remote(vec![api_addr], false, false, secret_api, false, None, None)
         .await?;
+
+    let repo_row = db
+        .query_as::<entity::repository::Model, _>(
+            "SELECT * FROM repositories WHERE name = ?1",
+            params!(name.clone()),
+        )
+        .await?
+        .into_iter()
+        .next();
 
     let Some(repo_row) = repo_row else {
         // No matching repository row (shouldn't normally happen for a repo
@@ -615,9 +713,11 @@ async fn run_check_push_protection(args: &[String]) -> anyhow::Result<i32> {
         return Ok(0);
     };
 
-    let rules = entity::prelude::BranchProtectionRule::find()
-        .filter(entity::branch_protection_rule::Column::RepoId.eq(repo_row.id))
-        .all(&db)
+    let rules = db
+        .query_as::<entity::branch_protection_rule::Model, _>(
+            "SELECT * FROM branch_protection_rules WHERE repo_id = ?1",
+            params!(repo_row.id.to_string()),
+        )
         .await?;
 
     if rules.is_empty() {
@@ -677,6 +777,18 @@ fn strip_git_suffix(name: &str) -> &str {
     name.strip_suffix(".git").unwrap_or(name)
 }
 
+/// Derives a Hiqlite Raft/API secret (must be at least 16 characters) from
+/// `JWT_SECRET` plus a fixed per-purpose suffix, so the single embedded node
+/// doesn't need its own separate secret env vars for a purely local,
+/// loopback-only Raft "cluster" of one. Padded if the input is short.
+fn hiqlite_secret(seed: &str, purpose: &str) -> String {
+    let mut secret = format!("{seed}-hiqlite-{purpose}");
+    while secret.len() < 16 {
+        secret.push('0');
+    }
+    secret
+}
+
 /// Loads and decrypts all Actions secrets for a repository, for injection
 /// into workflow job runs triggered by a push. Best-effort: if
 /// `SECRETS_ENCRYPTION_KEY` is unset or a value fails to decrypt, that
@@ -690,9 +802,12 @@ async fn load_repo_secrets(
         .map_err(|_| anyhow::anyhow!("SECRETS_ENCRYPTION_KEY environment variable must be set"))?;
     let key = actions::key_from_base64(&encoded)?;
 
-    let rows = entity::prelude::RepoSecret::find()
-        .filter(entity::repo_secret::Column::RepoId.eq(repo_id))
-        .all(&app_ctx.db)
+    let rows = app_ctx
+        .db
+        .query_as::<entity::repo_secret::Model, _>(
+            "SELECT * FROM repo_secrets WHERE repo_id = ?1",
+            params!(repo_id.to_string()),
+        )
         .await?;
 
     let mut out = HashMap::new();
@@ -716,9 +831,12 @@ async fn auto_stop_dev_workspaces(app_ctx: AppContext) {
     loop {
         interval.tick().await;
 
-        let workspaces = match entity::prelude::DevWorkspace::find()
-            .filter(entity::dev_workspace::Column::Status.eq(entity::dev_workspace::status::RUNNING))
-            .all(&app_ctx.db)
+        let workspaces = match app_ctx
+            .db
+            .query_as::<entity::dev_workspace::Model, _>(
+                "SELECT * FROM dev_workspaces WHERE status = ?1",
+                params!(entity::dev_workspace::status::RUNNING.to_string()),
+            )
             .await
         {
             Ok(w) => w,
@@ -749,9 +867,17 @@ async fn auto_stop_dev_workspaces(app_ctx: AppContext) {
                 continue;
             }
 
-            let mut active: entity::dev_workspace::ActiveModel = workspace.into();
-            active.status = Set(entity::dev_workspace::status::STOPPED.to_string());
-            if let Err(e) = active.update(&app_ctx.db).await {
+            let res = app_ctx
+                .db
+                .execute(
+                    "UPDATE dev_workspaces SET status = ?1 WHERE id = ?2",
+                    params!(
+                        entity::dev_workspace::status::STOPPED.to_string(),
+                        workspace.id.to_string()
+                    ),
+                )
+                .await;
+            if let Err(e) = res {
                 tracing::warn!("auto-stop: failed to update workspace status: {e}");
             }
         }
@@ -767,7 +893,11 @@ async fn sync_repo_mirrors(app_ctx: AppContext) {
         interval.tick().await;
 
         let now = chrono::Utc::now();
-        let mirrors = match entity::prelude::RepoMirror::find().all(&app_ctx.db).await {
+        let mirrors = match app_ctx
+            .db
+            .query_as::<entity::repo_mirror::Model, _>("SELECT * FROM repo_mirrors", vec![])
+            .await
+        {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("mirror sync: failed to list repo mirrors: {e}");
@@ -788,12 +918,18 @@ async fn sync_repo_mirrors(app_ctx: AppContext) {
                 continue;
             }
 
-            let repo = match entity::prelude::Repository::find_by_id(mirror.repo_id)
-                .one(&app_ctx.db)
+            let repo = match app_ctx
+                .db
+                .query_as::<entity::repository::Model, _>(
+                    "SELECT * FROM repositories WHERE id = ?1",
+                    params!(mirror.repo_id.to_string()),
+                )
                 .await
             {
-                Ok(Some(r)) => r,
-                Ok(None) => continue,
+                Ok(rows) => match rows.into_iter().next() {
+                    Some(r) => r,
+                    None => continue,
+                },
                 Err(e) => {
                     tracing::warn!("mirror sync: failed to load repository {}: {e}", mirror.repo_id);
                     continue;
@@ -801,18 +937,26 @@ async fn sync_repo_mirrors(app_ctx: AppContext) {
             };
 
             let owner_login = if repo.owner_type == "organization" {
-                entity::prelude::Organization::find_by_id(repo.owner_id)
-                    .one(&app_ctx.db)
+                app_ctx
+                    .db
+                    .query_as::<entity::organization::Model, _>(
+                        "SELECT * FROM organizations WHERE id = ?1",
+                        params!(repo.owner_id.to_string()),
+                    )
                     .await
                     .ok()
-                    .flatten()
+                    .and_then(|rows| rows.into_iter().next())
                     .map(|o| o.name)
             } else {
-                entity::prelude::User::find_by_id(repo.owner_id)
-                    .one(&app_ctx.db)
+                app_ctx
+                    .db
+                    .query_as::<entity::user::Model, _>(
+                        "SELECT * FROM users WHERE id = ?1",
+                        params!(repo.owner_id.to_string()),
+                    )
                     .await
                     .ok()
-                    .flatten()
+                    .and_then(|rows| rows.into_iter().next())
                     .map(|u| u.username)
             };
             let Some(owner_login) = owner_login else {
@@ -837,9 +981,14 @@ async fn sync_repo_mirrors(app_ctx: AppContext) {
 
             match result {
                 Ok(output) if output.status.success() => {
-                    let mut active: entity::repo_mirror::ActiveModel = mirror.into();
-                    active.last_synced_at = Set(Some(now));
-                    if let Err(e) = active.update(&app_ctx.db).await {
+                    let res = app_ctx
+                        .db
+                        .execute(
+                            "UPDATE repo_mirrors SET last_synced_at = ?1 WHERE id = ?2",
+                            params!(now.to_rfc3339(), mirror.id.to_string()),
+                        )
+                        .await;
+                    if let Err(e) = res {
                         tracing::warn!("mirror sync: failed to update last_synced_at: {e}");
                     }
                 }
@@ -871,9 +1020,16 @@ async fn workspace_proxy_handler(
     let workspace_id = Uuid::parse_str(&id)
         .map_err(|_| ServerError::BadRequest("invalid workspace id".to_string()))?;
 
-    let workspace = entity::prelude::DevWorkspace::find_by_id(workspace_id)
-        .one(&state.app_ctx.db)
+    let workspace = state
+        .app_ctx
+        .db
+        .query_as::<entity::dev_workspace::Model, _>(
+            "SELECT * FROM dev_workspaces WHERE id = ?1",
+            params!(workspace_id.to_string()),
+        )
         .await?
+        .into_iter()
+        .next()
         .ok_or_else(|| ServerError::NotFound(format!("workspace {id} not found")))?;
 
     let host_port = workspace
@@ -896,12 +1052,13 @@ async fn workspace_proxy_handler(
     {
         let db = state.app_ctx.db.clone();
         tokio::spawn(async move {
-            let mut active = entity::dev_workspace::ActiveModel {
-                id: Set(workspace_id),
-                ..Default::default()
-            };
-            active.last_activity_at = Set(Some(chrono::Utc::now()));
-            if let Err(e) = active.update(&db).await {
+            let res = db
+                .execute(
+                    "UPDATE dev_workspaces SET last_activity_at = ?1 WHERE id = ?2",
+                    params!(chrono::Utc::now().to_rfc3339(), workspace_id.to_string()),
+                )
+                .await;
+            if let Err(e) = res {
                 tracing::debug!("failed to bump workspace last_activity_at: {e}");
             }
         });
@@ -930,19 +1087,40 @@ async fn download_artifact_handler(
     let artifact_id = Uuid::parse_str(&id)
         .map_err(|_| ServerError::BadRequest("invalid artifact id".to_string()))?;
 
-    let artifact = entity::prelude::WorkflowArtifact::find_by_id(artifact_id)
-        .one(&state.app_ctx.db)
+    let artifact = state
+        .app_ctx
+        .db
+        .query_as::<entity::workflow_artifact::Model, _>(
+            "SELECT * FROM workflow_artifacts WHERE id = ?1",
+            params!(artifact_id.to_string()),
+        )
         .await?
+        .into_iter()
+        .next()
         .ok_or_else(|| ServerError::NotFound(format!("artifact {id} not found")))?;
 
-    let run = entity::prelude::WorkflowRun::find_by_id(artifact.run_id)
-        .one(&state.app_ctx.db)
+    let run = state
+        .app_ctx
+        .db
+        .query_as::<entity::workflow_run::Model, _>(
+            "SELECT * FROM workflow_runs WHERE id = ?1",
+            params!(artifact.run_id.to_string()),
+        )
         .await?
+        .into_iter()
+        .next()
         .ok_or_else(|| ServerError::NotFound("workflow run not found".to_string()))?;
 
-    let repo = entity::prelude::Repository::find_by_id(run.repo_id)
-        .one(&state.app_ctx.db)
+    let repo = state
+        .app_ctx
+        .db
+        .query_as::<entity::repository::Model, _>(
+            "SELECT * FROM repositories WHERE id = ?1",
+            params!(run.repo_id.to_string()),
+        )
         .await?
+        .into_iter()
+        .next()
         .ok_or_else(|| ServerError::NotFound("repository not found".to_string()))?;
 
     let user = auth::extract_user_from_headers(&headers, &state.app_ctx.jwt_secret, Some(&DbTokenLookup { db: state.app_ctx.db.clone() })).await;
@@ -976,7 +1154,7 @@ async fn download_artifact_handler(
 /// visibility), collapsed to a plain read-access boolean since this route
 /// doesn't need the finer-grained `Permission` levels.
 async fn user_has_repo_read_access(
-    db: &DatabaseConnection,
+    db: &hiqlite::Client,
     repo: &entity::repository::Model,
     user_id: Option<Uuid>,
 ) -> ServerResult<bool> {
@@ -990,25 +1168,30 @@ async fn user_has_repo_read_access(
     let is_owner = repo.owner_type == "user" && repo.owner_id == user_id;
 
     let is_admin_org_role = if repo.owner_type == "organization" {
-        entity::prelude::OrgMember::find()
-            .filter(entity::org_member::Column::OrgId.eq(repo.owner_id))
-            .filter(entity::org_member::Column::UserId.eq(user_id))
-            .one(db)
-            .await?
-            .map(|m| {
-                m.role == entity::org_member::role::OWNER
-                    || m.role == entity::org_member::role::ADMIN
-            })
-            .unwrap_or(false)
+        db.query_as::<entity::org_member::Model, _>(
+            "SELECT * FROM org_members WHERE org_id = ?1 AND user_id = ?2",
+            params!(repo.owner_id.to_string(), user_id.to_string()),
+        )
+        .await?
+        .into_iter()
+        .next()
+        .map(|m| {
+            m.role == entity::org_member::role::OWNER
+                || m.role == entity::org_member::role::ADMIN
+        })
+        .unwrap_or(false)
     } else {
         false
     };
 
-    let collaborator_perm = entity::prelude::RepoCollaborator::find()
-        .filter(entity::repo_collaborator::Column::RepoId.eq(repo.id))
-        .filter(entity::repo_collaborator::Column::UserId.eq(user_id))
-        .one(db)
+    let collaborator_perm = db
+        .query_as::<entity::repo_collaborator::Model, _>(
+            "SELECT * FROM repo_collaborators WHERE repo_id = ?1 AND user_id = ?2",
+            params!(repo.id.to_string(), user_id.to_string()),
+        )
         .await?
+        .into_iter()
+        .next()
         .map(|c| match c.permission.as_str() {
             entity::repo_collaborator::permission::ADMIN => auth::Permission::Admin,
             entity::repo_collaborator::permission::WRITE => auth::Permission::Write,
@@ -1058,18 +1241,28 @@ async fn package_upload_handler(
         return Err(ServerError::Unauthorized);
     }
 
-    let owner_user = entity::prelude::User::find()
-        .filter(entity::user::Column::Username.eq(owner.clone()))
-        .one(&state.app_ctx.db)
+    let owner_user = state
+        .app_ctx
+        .db
+        .query_as::<entity::user::Model, _>(
+            "SELECT * FROM users WHERE username = ?1",
+            params!(owner.clone()),
+        )
         .await?
+        .into_iter()
+        .next()
         .ok_or_else(|| ServerError::NotFound(format!("user {owner} not found")))?;
 
-    let existing = entity::prelude::Package::find()
-        .filter(entity::package::Column::OwnerId.eq(owner_user.id))
-        .filter(entity::package::Column::Name.eq(name.clone()))
-        .filter(entity::package::Column::Version.eq(version.clone()))
-        .one(&state.app_ctx.db)
-        .await?;
+    let existing = state
+        .app_ctx
+        .db
+        .query_as::<entity::package::Model, _>(
+            "SELECT * FROM packages WHERE owner_id = ?1 AND name = ?2 AND version = ?3",
+            params!(owner_user.id.to_string(), name.clone(), version.clone()),
+        )
+        .await?
+        .into_iter()
+        .next();
     if existing.is_some() {
         return Err(ServerError::Conflict(format!(
             "package {owner}/{name}@{version} has already been published and cannot be overwritten"
@@ -1090,18 +1283,24 @@ async fn package_upload_handler(
         .await
         .map_err(|e| ServerError::Internal(e.into()))?;
 
-    let package = entity::package::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        repo_id: Set(None),
-        owner_id: Set(owner_user.id),
-        name: Set(name),
-        version: Set(version),
-        package_type: Set("generic".to_string()),
-        file_path: Set(file_path.to_string_lossy().to_string()),
-        size_bytes: Set(body.len() as i64),
-        created_at: Set(chrono::Utc::now()),
-    };
-    package.insert(&state.app_ctx.db).await?;
+    state
+        .app_ctx
+        .db
+        .execute(
+            "INSERT INTO packages (id, repo_id, owner_id, name, version, package_type, file_path, size_bytes, created_at) \
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params!(
+                Uuid::new_v4().to_string(),
+                owner_user.id.to_string(),
+                name,
+                version,
+                "generic".to_string(),
+                file_path.to_string_lossy().to_string(),
+                body.len() as i64,
+                chrono::Utc::now().to_rfc3339()
+            ),
+        )
+        .await?;
 
     Ok(StatusCode::CREATED.into_response())
 }
@@ -1113,18 +1312,28 @@ async fn package_download_handler(
     State(state): State<ServerState>,
     AxumPath((owner, name, version)): AxumPath<(String, String, String)>,
 ) -> ServerResult<Response> {
-    let owner_user = entity::prelude::User::find()
-        .filter(entity::user::Column::Username.eq(owner.clone()))
-        .one(&state.app_ctx.db)
+    let owner_user = state
+        .app_ctx
+        .db
+        .query_as::<entity::user::Model, _>(
+            "SELECT * FROM users WHERE username = ?1",
+            params!(owner.clone()),
+        )
         .await?
+        .into_iter()
+        .next()
         .ok_or_else(|| ServerError::NotFound(format!("user {owner} not found")))?;
 
-    let package = entity::prelude::Package::find()
-        .filter(entity::package::Column::OwnerId.eq(owner_user.id))
-        .filter(entity::package::Column::Name.eq(name.clone()))
-        .filter(entity::package::Column::Version.eq(version.clone()))
-        .one(&state.app_ctx.db)
+    let package = state
+        .app_ctx
+        .db
+        .query_as::<entity::package::Model, _>(
+            "SELECT * FROM packages WHERE owner_id = ?1 AND name = ?2 AND version = ?3",
+            params!(owner_user.id.to_string(), name.clone(), version.clone()),
+        )
         .await?
+        .into_iter()
+        .next()
         .ok_or_else(|| ServerError::NotFound(format!("package {owner}/{name}@{version} not found")))?;
 
     let bytes = tokio::fs::read(&package.file_path)

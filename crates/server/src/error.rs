@@ -23,7 +23,7 @@ pub enum ServerError {
     DevEnv(#[from] dev_env::DevEnvError),
 
     #[error("database error: {0}")]
-    Db(#[from] sea_orm::DbErr),
+    Db(#[from] hiqlite::Error),
 
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),

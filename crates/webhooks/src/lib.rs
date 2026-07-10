@@ -1,5 +1,4 @@
 use hmac::{Hmac, Mac};
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use sha2::Sha256;
 use uuid::Uuid;
 
@@ -7,12 +6,12 @@ type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
 pub struct WebhookDispatcher {
-    db: DatabaseConnection,
+    db: hiqlite::Client,
     client: reqwest::Client,
 }
 
 impl WebhookDispatcher {
-    pub fn new(db: DatabaseConnection) -> Self {
+    pub fn new(db: hiqlite::Client) -> Self {
         Self {
             db,
             client: reqwest::Client::new(),
@@ -28,10 +27,12 @@ impl WebhookDispatcher {
         event_name: &str,
         payload: serde_json::Value,
     ) -> anyhow::Result<()> {
-        let webhooks = entity::prelude::Webhook::find()
-            .filter(entity::webhook::Column::RepoId.eq(repo_id))
-            .filter(entity::webhook::Column::Active.eq(true))
-            .all(&self.db)
+        let webhooks = self
+            .db
+            .query_as::<entity::webhook::Model, _>(
+                "SELECT * FROM webhooks WHERE repo_id = ?1 AND active = 1",
+                hiqlite::params!(repo_id.to_string()),
+            )
             .await?;
 
         let body = serde_json::json!({
@@ -41,13 +42,8 @@ impl WebhookDispatcher {
         let body_bytes = serde_json::to_vec(&body)?;
 
         for webhook in webhooks {
-            let subscribed = webhook
-                .events
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .any(|v| v.as_str() == Some(event_name))
-                })
+            let subscribed = serde_json::from_str::<Vec<String>>(&webhook.events)
+                .map(|arr| arr.iter().any(|v| v == event_name))
                 .unwrap_or(false);
             if !subscribed {
                 continue;

@@ -5,9 +5,11 @@
 # precedence over values in this file. Names below show the env var
 # each setting corresponds to.
 
-# Postgres connection string used by sea-orm.
-# Env: DATABASE_URL
-database_url = "postgres://genome:genome@localhost:5432/genome"
+# Directory the embedded Hiqlite database (Raft-replicated SQLite) stores
+# its data, WAL and snapshots under. There is no separate database service
+# to configure or run -- Hiqlite is embedded directly in this binary.
+# Env: DATA_DIR
+data_dir = "./data/hiqlite"
 
 # Secret used to sign/verify JWTs issued by the auth crate.
 # MUST be overridden with a long, random value in any non-local environment.

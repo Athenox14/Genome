@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 entity = { path = "../entity" }
 
-sea-orm = { workspace = true }
+hiqlite = { version = "0.14", features = ["sqlite", "server"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

@@ -26,8 +26,8 @@ Rust workspace, one crate per concern:
 
 | Crate | Responsibility |
 |---|---|
-| `entity` | SeaORM entity models for all tables |
-| `migration` | SeaORM migrations |
+| `entity` | Row structs for all tables, queried via raw SQL through `hiqlite::Client` |
+| `migration` | Hiqlite (embedded, Raft-replicated SQLite) migrations |
 | `git-core` | Bare repo storage, smart-HTTP transport, wiki, merge (merge/squash/rebase), branch protection ancestry checks |
 | `ssh-server` | git-over-SSH (russh), pubkey auth against registered SSH keys |
 | `auth` | JWT, PAT hashing, argon2 password hashing, TOTP 2FA, permission model |
@@ -35,29 +35,30 @@ Rust workspace, one crate per concern:
 | `dev-env` | Coder-like containerized dev workspaces (bollard/Docker), auto-stop scheduling |
 | `webhooks` | HMAC-signed webhook dispatch |
 | `graphql-api` | The GraphQL schema (async-graphql) wiring everything together |
-| `server` | axum binary: HTTP router (GraphQL, git smart-HTTP, packages, artifacts), spawns the SSH server and background loops (mirror sync, workspace auto-stop) |
+| `server` | axum binary: HTTP router (GraphQL, git smart-HTTP, packages, artifacts), spawns the SSH server, embeds the Hiqlite database node, and runs background loops (mirror sync, workspace auto-stop) |
 
 `frontend/` is an independent Nuxt 3 + Vue 3 app for browsing/testing against
 the GraphQL API — not required for production use.
 
 ## Running locally
 
-Requires Docker (for Postgres + spawning Actions/workspace containers) and a
+There is no separate database service to start: Hiqlite (an embedded,
+Raft-replicated SQLite database) runs inside the `server` process itself, so
+this only requires Docker for spawning Actions/workspace containers, plus a
 Rust toolchain.
 
 ```bash
-docker compose up -d db
-export DATABASE_URL="postgres://genome:genome@127.0.0.1:5432/genome"
 export JWT_SECRET="change-me"
 export REPOS_ROOT_PATH="./data/repos"
+export DATA_DIR="./data/hiqlite"
 export SECRETS_ENCRYPTION_KEY="$(openssl rand -base64 32)"
 cargo run -p server
 ```
 
-The server runs migrations automatically on startup. See
-`config/genome.example.toml` for the full list of environment variables
-(`LISTEN_ADDR`, `SSH_LISTEN_ADDR`, `PACKAGES_ROOT_PATH`, `FRONTEND_URL`,
-`DOCKER_SOCKET_PATH`, ...).
+The server runs migrations automatically on startup, storing its data under
+`DATA_DIR`. See `config/genome.example.toml` for the full list of
+environment variables (`LISTEN_ADDR`, `SSH_LISTEN_ADDR`,
+`PACKAGES_ROOT_PATH`, `FRONTEND_URL`, `DOCKER_SOCKET_PATH`, ...).
 
 To also run the frontend: `cd frontend && npm install && npm run dev`
 (defaults to pointing at `http://localhost:8000`).
@@ -69,12 +70,18 @@ docker compose up -d --build
 ```
 
 This builds `Dockerfile` (multi-stage Rust release build → slim Debian
-runtime) and starts `db` + `server` (+ `frontend` if you want the web UI).
-The image is also published to `ghcr.io/<owner>/genome` automatically by
-`.github/workflows/docker-publish.yml` on every push to `main`.
+runtime) and starts `server` (+ `frontend` if you want the web UI). Since
+Hiqlite is embedded directly in the `server` binary rather than run as a
+separate service, this is the entire database story: no external database to
+provision, patch, or fail over independently — replication and leader
+failover happen via Raft consensus inside the same process(es) you're already
+deploying, which is what gives this an embedded-HA story "for free" if/when
+multi-node configuration is added. The image is also published to
+`ghcr.io/<owner>/genome` automatically by `.github/workflows/docker-publish.yml`
+on every push to `main`.
 
 Since this is meant to run **API-only** in production, the frontend service
-in `docker-compose.yml` is optional — omit it (`docker compose up -d db
+in `docker-compose.yml` is optional — omit it (`docker compose up -d
 server`) if you only need the API/git/CI surface.
 
 ## API-first usage

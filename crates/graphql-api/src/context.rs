@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
-use sea_orm::DatabaseConnection;
-
 /// Global application context shared across all GraphQL requests.
+///
+/// `hiqlite::Client` is cheaply `Clone` (it wraps its own internal shared
+/// state), so it is stored directly rather than behind an extra `Arc`.
 #[derive(Clone)]
 pub struct AppContext {
-    pub db: DatabaseConnection,
+    pub db: hiqlite::Client,
     pub repo_manager: Arc<git_core::RepoManager>,
     pub jwt_secret: String,
     pub actions_executor: Arc<actions::Executor>,

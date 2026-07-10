@@ -11,7 +11,7 @@ pub enum SshServerError {
     Io(#[from] std::io::Error),
 
     #[error("database error: {0}")]
-    Db(#[from] sea_orm::DbErr),
+    Db(#[from] hiqlite::Error),
 
     #[error("git-core error: {0}")]
     GitCore(#[from] git_core::error::GitCoreError),

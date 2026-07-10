@@ -1,62 +1,81 @@
 //! Integration tests for `graphql-api` that exercise real GraphQL
-//! mutations/queries against a live Postgres database (schema brought up to
-//! date via `migration::Migrator::up`) and (for repository creation) a real
-//! on-disk bare git repo via `git-core`.
+//! mutations/queries against a live Hiqlite (embedded, Raft-replicated
+//! SQLite) instance and (for repository creation) a real on-disk bare git
+//! repo via `git-core`.
 //!
-//! These require `DATABASE_URL` to point at a reachable Postgres instance
-//! (the CI workflow's `postgres:16` service container provides one; see
-//! `.github/workflows/docker-publish.yml`). Locally, if no database is
-//! reachable, these tests will fail at connection time -- that's expected
-//! and is why CI (not this dev machine, whose Docker networking is broken)
-//! is the source of truth for whether they pass.
+//! Unlike the old Postgres-backed setup, there is no external database to
+//! reach: each call to `test_schema()` spins up its own single-node Hiqlite
+//! instance in a fresh `tempfile::tempdir()`, with its own API/Raft ports
+//! (allocated from an atomic counter so concurrently-running tests, which is
+//! the default `cargo test` behavior, never clash on a `bind()`). Since each
+//! test gets a wholly independent database, there is no shared-migration
+//! race to guard against (unlike the old single shared Postgres database),
+//! so no `OnceCell`-guarded shared-migration-run trick is needed here.
 //!
-//! Test isolation: rather than wrapping each test in a DB transaction, every
-//! test generates unique usernames/repo names via `uuid::Uuid::new_v4()` so
-//! that tests can run concurrently (the default `cargo test` behavior)
-//! without colliding on unique constraints.
+//! Test isolation: every test also generates unique usernames/repo names via
+//! `uuid::Uuid::new_v4()` as a second layer of isolation (relevant if this
+//! ever moves back to a shared database).
 
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 
 use async_graphql::Request;
-use migration::MigratorTrait;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde_json::json;
-use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use graphql_api::{build_schema, AppContext, GraphQLSchema, RequestContext};
 
-/// `cargo test` runs tests in this file concurrently by default, but
-/// `Migrator::up` is not safe to call concurrently against a fresh database:
-/// two racing callers both try to create Postgres's own `seaql_migrations`
-/// tracking type and one loses a unique-constraint race. Run it exactly once
-/// per test-binary process; every test just awaits the same completion.
-static MIGRATIONS_DONE: OnceCell<()> = OnceCell::const_new();
+/// Base port for the atomic per-test port allocator; each test reserves 2
+/// consecutive ports (API + Raft).
+static NEXT_PORT: AtomicU16 = AtomicU16::new(23100);
 
-async fn ensure_migrated(db: &DatabaseConnection) {
-    MIGRATIONS_DONE
-        .get_or_init(|| async {
-            migration::Migrator::up(db, None)
-                .await
-                .expect("failed to run migrations against test database");
-        })
-        .await;
+fn alloc_ports() -> (u16, u16) {
+    let base = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
+    (base, base + 1)
 }
 
-/// Builds a fresh `AppContext` (and schema) wired up to the test database,
-/// with `RepoManager` pointed at a throwaway temp directory so created bare
-/// repos don't pollute `./data/repos`, and the actions/dev-env managers
-/// constructed in a way that doesn't require a reachable Docker daemon at
-/// context-construction time.
+/// Builds a fresh `AppContext` (and schema) wired up to a throwaway,
+/// single-node Hiqlite instance, with `RepoManager` pointed at a throwaway
+/// temp directory so created bare repos don't pollute `./data/repos`, and
+/// the actions/dev-env managers constructed in a way that doesn't require a
+/// reachable Docker daemon at context-construction time.
 async fn test_schema() -> (GraphQLSchema, AppContext, tempfile::TempDir) {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://genome:genome@localhost:5432/genome".to_string());
+    let data_tmp = tempfile::tempdir().expect("failed to create temp dir for hiqlite data_dir");
+    let (api_port, raft_port) = alloc_ports();
+    let api_addr = format!("127.0.0.1:{api_port}");
+    let raft_addr = format!("127.0.0.1:{raft_port}");
 
-    let db: DatabaseConnection = sea_orm::Database::connect(&database_url)
+    let enc_key_bytes: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(format!("test-enc-key-{api_port}").as_bytes()).into()
+    };
+    let node_config = hiqlite::NodeConfig {
+        node_id: 1,
+        nodes: vec![hiqlite::Node {
+            id: 1,
+            addr_raft: raft_addr.clone(),
+            addr_api: api_addr.clone(),
+        }],
+        // `listen_addr_*` is just the bind HOST (no port) -- hiqlite derives
+        // the port from the matching `Node.addr_*` entry above.
+        listen_addr_api: "127.0.0.1".into(),
+        listen_addr_raft: "127.0.0.1".into(),
+        data_dir: data_tmp.path().to_string_lossy().to_string().into(),
+        filename_db: "genome.db".into(),
+        secret_raft: "test-secret-for-integration-tests-raft".to_string(),
+        secret_api: "test-secret-for-integration-tests-api-".to_string(),
+        enc_keys: cryptr::EncKeys {
+            enc_key_active: "k1".to_string(),
+            enc_keys: vec![("k1".to_string(), enc_key_bytes.to_vec())],
+        },
+        ..Default::default()
+    };
+    let db = hiqlite::start_node(node_config)
         .await
-        .expect("failed to connect to test database (is DATABASE_URL reachable?)");
-
-    ensure_migrated(&db).await;
+        .expect("failed to start embedded Hiqlite test instance");
+    db.migrate::<migration::Migrations>()
+        .await
+        .expect("failed to run migrations against test database");
 
     let repos_tmp = tempfile::tempdir().expect("failed to create temp dir for repos root");
     let artifacts_tmp = tempfile::tempdir().expect("failed to create temp dir for artifacts root");
@@ -152,11 +171,15 @@ async fn register_user(
     let data = data_json(resp);
     assert_eq!(data["register"]["username"], json!(username));
 
-    entity::prelude::User::find()
-        .filter(entity::user::Column::Username.eq(username))
-        .one(&app.db)
+    app.db
+        .query_as::<entity::user::Model, _>(
+            "SELECT * FROM users WHERE username = ?1",
+            hiqlite::params!(username.to_string()),
+        )
         .await
         .expect("db query failed")
+        .into_iter()
+        .next()
         .expect("user row should exist right after register")
 }
 
@@ -259,18 +282,29 @@ async fn create_access_token_then_pat_resolved_claims_authenticate() {
     // does in `crates/server/src/main.rs`: hash the plaintext and look up the
     // `access_token` row by `token_hash`.
     let token_hash = auth::hash_token(&pat_plaintext);
-    let token_row = entity::prelude::AccessToken::find()
-        .filter(entity::access_token::Column::TokenHash.eq(token_hash))
-        .one(&app.db)
+    let token_row = app
+        .db
+        .query_as::<entity::access_token::Model, _>(
+            "SELECT * FROM access_tokens WHERE token_hash = ?1",
+            hiqlite::params!(token_hash),
+        )
         .await
         .expect("db query failed")
+        .into_iter()
+        .next()
         .expect("access token row should exist after createAccessToken");
     assert_eq!(token_row.user_id, user.id);
 
-    let resolved_user = entity::prelude::User::find_by_id(token_row.user_id)
-        .one(&app.db)
+    let resolved_user = app
+        .db
+        .query_as::<entity::user::Model, _>(
+            "SELECT * FROM users WHERE id = ?1",
+            hiqlite::params!(token_row.user_id.to_string()),
+        )
         .await
         .expect("db query failed")
+        .into_iter()
+        .next()
         .expect("owning user should exist");
     let resolved_claims = claims_for(&resolved_user);
 
@@ -320,12 +354,16 @@ async fn create_repository_inserts_row_and_creates_bare_repo_on_disk() {
     assert_eq!(data["createRepository"]["name"], json!(repo_name));
     assert_eq!(data["createRepository"]["isPrivate"], json!(true));
 
-    let repo_row = entity::prelude::Repository::find()
-        .filter(entity::repository::Column::Name.eq(repo_name.clone()))
-        .filter(entity::repository::Column::OwnerId.eq(user.id))
-        .one(&app.db)
+    let repo_row = app
+        .db
+        .query_as::<entity::repository::Model, _>(
+            "SELECT * FROM repositories WHERE name = ?1 AND owner_id = ?2",
+            hiqlite::params!(repo_name.clone(), user.id.to_string()),
+        )
         .await
         .expect("db query failed")
+        .into_iter()
+        .next()
         .expect("repository row should exist after createRepository");
     assert!(repo_row.is_private);
 
@@ -396,10 +434,16 @@ async fn create_issue_then_close_it_updates_state() {
     let data = data_json(resp);
     assert_eq!(data["updateIssue"]["state"], json!("closed"));
 
-    let issue_row = entity::prelude::Issue::find_by_id(Uuid::parse_str(&issue_id).unwrap())
-        .one(&app.db)
+    let issue_row = app
+        .db
+        .query_as::<entity::issue::Model, _>(
+            "SELECT * FROM issues WHERE id = ?1",
+            hiqlite::params!(issue_id.clone()),
+        )
         .await
         .expect("db query failed")
+        .into_iter()
+        .next()
         .expect("issue row should exist");
     assert_eq!(issue_row.state, entity::issue::state::CLOSED);
     assert!(issue_row.closed_at.is_some());

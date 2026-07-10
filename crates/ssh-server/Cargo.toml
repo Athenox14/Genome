@@ -9,7 +9,7 @@ entity = { path = "../entity" }
 auth = { path = "../auth" }
 git-core = { path = "../git-core" }
 tokio = { workspace = true }
-sea-orm = { workspace = true }
+hiqlite = { version = "0.14", features = ["sqlite", "server"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

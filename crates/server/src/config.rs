@@ -3,7 +3,19 @@ use anyhow::{Context, Result};
 /// Runtime configuration for the server, loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub database_url: String,
+    /// Directory Hiqlite (the embedded, Raft-replicated SQLite database)
+    /// stores its data, WAL and snapshots under. Replaces the old
+    /// `DATABASE_URL` Postgres connection string entirely -- there is no
+    /// external database process to point at any more.
+    pub data_dir: String,
+    /// Address the embedded Hiqlite node's API listens on / is reached at
+    /// (used both for the single-node `NodeConfig` built at startup and by
+    /// the `check-push-protection` CLI subcommand, which connects to the
+    /// already-running server as a remote Hiqlite client rather than
+    /// starting its own Raft node).
+    pub hiqlite_api_addr: String,
+    /// Address the embedded Hiqlite node's internal Raft traffic listens on.
+    pub hiqlite_raft_addr: String,
     pub jwt_secret: String,
     pub repos_root_path: String,
     pub listen_addr: String,
@@ -32,8 +44,11 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let database_url = std::env::var("DATABASE_URL")
-            .context("DATABASE_URL environment variable must be set")?;
+        let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data/hiqlite".to_string());
+        let hiqlite_api_addr =
+            std::env::var("HIQLITE_API_ADDR").unwrap_or_else(|_| "127.0.0.1:8200".to_string());
+        let hiqlite_raft_addr =
+            std::env::var("HIQLITE_RAFT_ADDR").unwrap_or_else(|_| "127.0.0.1:8100".to_string());
         let jwt_secret = std::env::var("JWT_SECRET")
             .context("JWT_SECRET environment variable must be set")?;
         let repos_root_path =
@@ -68,7 +83,9 @@ impl Config {
         });
 
         Ok(Config {
-            database_url,
+            data_dir,
+            hiqlite_api_addr,
+            hiqlite_raft_addr,
             jwt_secret,
             repos_root_path,
             listen_addr,

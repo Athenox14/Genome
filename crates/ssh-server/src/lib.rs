@@ -21,7 +21,7 @@ use std::sync::Arc;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{Auth, Config as RusshConfig, Handler, Msg, Server as RusshServer, Session};
 use russh::{Channel, ChannelId};
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use hiqlite::params;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
 use uuid::Uuid;
@@ -45,7 +45,7 @@ pub struct SshServerConfig {
 
 /// State shared across all SSH connections.
 pub struct SharedState {
-    pub db: DatabaseConnection,
+    pub db: hiqlite::Client,
     pub repo_manager: Arc<git_core::RepoManager>,
 }
 
@@ -234,18 +234,31 @@ impl Handler for GitSshHandler {
             Err(_) => return Ok(Auth::reject()),
         };
 
-        let key_row = entity::prelude::SshKey::find()
-            .filter(entity::ssh_key::Column::Fingerprint.eq(fingerprint))
-            .one(&self.state.db)
-            .await?;
+        let key_row = self
+            .state
+            .db
+            .query_as::<entity::ssh_key::Model, _>(
+                "SELECT * FROM ssh_keys WHERE fingerprint = ?1",
+                params!(fingerprint),
+            )
+            .await?
+            .into_iter()
+            .next();
 
         let Some(key_row) = key_row else {
             return Ok(Auth::reject());
         };
 
-        let user_row = entity::prelude::User::find_by_id(key_row.user_id)
-            .one(&self.state.db)
-            .await?;
+        let user_row = self
+            .state
+            .db
+            .query_as::<entity::user::Model, _>(
+                "SELECT * FROM users WHERE id = ?1",
+                params!(key_row.user_id.to_string()),
+            )
+            .await?
+            .into_iter()
+            .next();
 
         let Some(user_row) = user_row else {
             return Ok(Auth::reject());
