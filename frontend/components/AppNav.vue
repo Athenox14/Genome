@@ -158,9 +158,6 @@ watch(() => auth.isAuthenticated, (value) => {
                 <div class="border-b border-border-dark px-3 py-2 text-fg-dark">
                   Signed in as <strong>{{ auth.user?.username }}</strong>
                 </div>
-                <NuxtLink to="/settings/security" class="block px-3 py-1.5 text-fg-dark hover:bg-white/5" @click="showUserMenu = false">
-                  Security settings
-                </NuxtLink>
                 <button class="block w-full px-3 py-1.5 text-left text-fg-dark hover:bg-white/5" @click="handleLogout">
                   Log out
                 </button>

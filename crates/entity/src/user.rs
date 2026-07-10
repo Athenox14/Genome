@@ -13,7 +13,5 @@ pub struct Model {
     pub is_admin: bool,
     pub avatar_url: Option<String>,
     pub created_at: DateTime<Utc>,
-    pub totp_secret: Option<String>,
-    pub totp_enabled: bool,
     pub deactivated_at: Option<DateTime<Utc>>,
 }

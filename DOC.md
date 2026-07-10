@@ -18,7 +18,7 @@ Rust workspace, one crate per concern, all wired together by `crates/server`:
 | `migration` | Hiqlite (embedded, Raft-replicated SQLite) schema migrations |
 | `git-core` | Bare repo storage, git smart-HTTP transport, wiki (second bare repo per project), merge (merge/squash/rebase), branch-protection ancestry checks, pre-receive hook generation |
 | `ssh-server` | git-over-SSH (russh), pubkey auth against registered SSH keys |
-| `auth` | JWT, PAT hashing, argon2 password hashing, TOTP 2FA, permission model |
+| `auth` | JWT, PAT hashing, argon2 password hashing, permission model |
 | `actions` | GitHub-Actions-compatible workflow YAML parser + Docker-based job executor, AES-256-GCM-encrypted secrets |
 | `dev-env` | Coder-like containerized dev workspaces (bollard/Docker), auto-stop scheduling, HTTP reverse-proxy to the workspace |
 | `webhooks` | HMAC-SHA256-signed webhook dispatch |
@@ -100,9 +100,7 @@ Since this is meant to run **API-only**, omit `frontend`:
 
 Three ways to authenticate, all via the `Authorization` header:
 
-1. **`Authorization: Bearer <jwt>`** — from the `login` mutation. Supports
-   TOTP 2FA (optional `totpCode` argument; `login` returns a `totp_required`
-   or `totp_invalid` GraphQL error if 2FA is enabled and the code is missing/wrong).
+1. **`Authorization: Bearer <jwt>`** — from the `login` mutation.
 2. **`Authorization: token <pat>`** — a personal access token from
    `createAccessToken`. **This is the intended path for API/automation use**,
    since it needs no session/login step per call.
@@ -152,7 +150,6 @@ served for interactive exploration). Exact argument types/names are in
 ### Mutations, grouped
 
 **Auth & account**: `register`, `login`, `addSshKey`, `removeSshKey`,
-`enableTwoFactor`, `confirmTwoFactor`, `disableTwoFactor`,
 `createAccessToken`, `revokeAccessToken`.
 
 **Repositories**: `createRepository`, `updateRepository`,
@@ -268,14 +265,18 @@ in-process by `server`.
 
 ## 7. Dev workspaces (Coder-like)
 
-`createDevWorkspace(name, image, autoStopMinutes?)` starts a Docker
-container (default images include `codercom/code-server:latest` for a
-browser VS Code, or any image you specify) with resource limits, optionally
-cloning a repo into it on start. Access it through Genome's own domain via
-`GET /workspaces/:id/proxy/*path` (reverse-proxied to the container) rather
-than exposing raw container ports. `autoStopMinutes` + a background loop
-stop idle workspaces automatically; `execInDevWorkspace` runs an arbitrary
-command inside a running workspace.
+`createDevWorkspace(name, template?, image?, autoStopMinutes?)` starts a
+Docker container with resource limits, optionally cloning a repo into it on
+start. Pass `template` to pick a built-in configuration (`"code-server"`,
+`"rust-dev"`, `"node-dev"` — see `dev_env::templates`), which resolves to an
+image plus a set of named ports; or pass a raw `image` for advanced/custom
+use, which falls back to the single-port code-server-only behavior. Access a
+workspace's default port through Genome's own domain via
+`GET /workspaces/:id/proxy/*path`, or an explicitly named port via
+`GET /workspaces/:id/proxy_port/:portName/*path` (both reverse-proxied to
+the container) rather than exposing raw container ports. `autoStopMinutes` +
+a background loop stop idle workspaces automatically; `execInDevWorkspace`
+runs an arbitrary command inside a running workspace.
 
 ---
 

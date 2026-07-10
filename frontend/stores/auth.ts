@@ -23,8 +23,8 @@ const TOKEN_STORAGE_KEY = 'genome_auth_token'
 //   me { id username email avatarUrl }
 // }
 const LOGIN_MUTATION = /* GraphQL */ `
-  mutation Login($username: String!, $password: String!, $totpCode: String) {
-    login(username: $username, password: $password, totpCode: $totpCode) {
+  mutation Login($username: String!, $password: String!) {
+    login(username: $username, password: $password) {
       token
       user {
         id
@@ -54,8 +54,7 @@ export const useAuthStore = defineStore('auth', {
     token: null as string | null,
     user: null as CurrentUser | null,
     loading: false,
-    error: null as string | null,
-    totpRequired: false
+    error: null as string | null
   }),
 
   getters: {
@@ -79,10 +78,9 @@ export const useAuthStore = defineStore('auth', {
       }
     },
 
-    async login(username: string, password: string, totpCode?: string) {
+    async login(username: string, password: string) {
       this.loading = true
       this.error = null
-      this.totpRequired = false
       const config = useRuntimeConfig()
       try {
         const res = await $fetch<{
@@ -92,23 +90,12 @@ export const useAuthStore = defineStore('auth', {
           method: 'POST',
           body: {
             query: LOGIN_MUTATION,
-            variables: { username, password, totpCode: totpCode || null }
+            variables: { username, password }
           }
         })
 
         if (res.errors?.length) {
-          const message = res.errors[0].message
-          if (message === 'totp_required') {
-            this.totpRequired = true
-            this.error = totpCode ? null : 'Enter your two-factor authentication code'
-            return false
-          }
-          if (message === 'totp_invalid') {
-            this.totpRequired = true
-            this.error = 'Invalid two-factor authentication code'
-            return false
-          }
-          throw new Error(message)
+          throw new Error(res.errors[0].message)
         }
 
         const payload = res.data?.login

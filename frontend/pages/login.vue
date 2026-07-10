@@ -6,10 +6,9 @@ const router = useRouter()
 
 const username = ref('')
 const password = ref('')
-const totpCode = ref('')
 
 async function onSubmit() {
-  const ok = await auth.login(username.value, password.value, totpCode.value || undefined)
+  const ok = await auth.login(username.value, password.value)
   if (ok) {
     router.push('/')
   }
@@ -27,7 +26,6 @@ async function onSubmit() {
           v-model="username"
           type="text"
           required
-          :disabled="auth.totpRequired"
           class="w-full rounded border border-border px-3 py-2 text-sm text-fg disabled:opacity-50"
         />
       </div>
@@ -38,23 +36,7 @@ async function onSubmit() {
           v-model="password"
           type="password"
           required
-          :disabled="auth.totpRequired"
           class="w-full rounded border border-border px-3 py-2 text-sm text-fg disabled:opacity-50"
-        />
-      </div>
-
-      <div v-if="auth.totpRequired">
-        <label class="mb-1 block text-sm font-medium text-fg-muted">
-          Two-factor authentication code
-        </label>
-        <input
-          v-model="totpCode"
-          type="text"
-          inputmode="numeric"
-          autocomplete="one-time-code"
-          placeholder="123456"
-          required
-          class="w-full rounded border border-border px-3 py-2 text-sm text-fg"
         />
       </div>
 
@@ -65,7 +47,7 @@ async function onSubmit() {
         :disabled="auth.loading"
         class="gh-btn-primary w-full disabled:opacity-50"
       >
-        {{ auth.loading ? 'Logging in…' : (auth.totpRequired ? 'Verify code' : 'Log in') }}
+        {{ auth.loading ? 'Logging in…' : 'Log in' }}
       </button>
     </form>
   </div>

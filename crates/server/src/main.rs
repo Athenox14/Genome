@@ -220,6 +220,10 @@ async fn main() -> anyhow::Result<()> {
             get(workspace_proxy_handler).post(workspace_proxy_handler),
         )
         .route(
+            "/workspaces/:id/proxy_port/:port_name/*path",
+            get(workspace_proxy_named_handler).post(workspace_proxy_named_handler),
+        )
+        .route(
             "/packages/:owner/:name/:version",
             put(package_upload_handler).get(package_download_handler),
         )
@@ -1043,16 +1047,15 @@ async fn bootstrap_admin_token(db: &hiqlite::Client, bootstrap_token: &str) -> a
             let password_hash = auth::hash_password(&random_unusable_password)
                 .map_err(|e| anyhow::anyhow!("failed to hash bootstrap admin password: {e}"))?;
             db.execute(
-                "INSERT INTO users (id, username, email, password_hash, is_admin, avatar_url, created_at, totp_secret, totp_enabled, deactivated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, ?7, NULL)",
+                "INSERT INTO users (id, username, email, password_hash, is_admin, avatar_url, created_at, deactivated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL)",
                 params!(
                     id.to_string(),
                     BOOTSTRAP_USERNAME.to_string(),
                     "admin@localhost".to_string(),
                     password_hash,
                     1i64,
-                    chrono::Utc::now().to_rfc3339(),
-                    0i64
+                    chrono::Utc::now().to_rfc3339()
                 ),
             )
             .await?;
@@ -1301,9 +1304,32 @@ async fn sync_repo_mirrors(app_ctx: AppContext) {
 // Dev workspace proxy
 // ---------------------------------------------------------------------
 
+/// `/workspaces/:id/proxy/*path` — proxies to the workspace's default port
+/// (named "http" if bound, else whichever single port the workspace has).
+/// Kept for backward compatibility with callers written before named ports.
 async fn workspace_proxy_handler(
     State(state): State<ServerState>,
     AxumPath((id, path)): AxumPath<(String, String)>,
+    req: Request,
+) -> ServerResult<Response> {
+    proxy_workspace_request(state, id, None, path, req).await
+}
+
+/// `/workspaces/:id/proxy_port/:port_name/*path` — proxies to an explicitly
+/// named port on the workspace (e.g. a second service alongside code-server).
+async fn workspace_proxy_named_handler(
+    State(state): State<ServerState>,
+    AxumPath((id, port_name, path)): AxumPath<(String, String, String)>,
+    req: Request,
+) -> ServerResult<Response> {
+    proxy_workspace_request(state, id, Some(port_name), path, req).await
+}
+
+async fn proxy_workspace_request(
+    state: ServerState,
+    id: String,
+    port_name: Option<String>,
+    path: String,
     req: Request,
 ) -> ServerResult<Response> {
     let workspace_id = Uuid::parse_str(&id)
@@ -1321,21 +1347,11 @@ async fn workspace_proxy_handler(
         .next()
         .ok_or_else(|| ServerError::NotFound(format!("workspace {id} not found")))?;
 
-    let host_port = workspace
-        .container_id
-        .as_ref()
-        .and_then(|_| None::<u16>)
-        .unwrap_or(0);
-
-    // The dev_workspace row does not store the host port directly; it is
-    // only known at container-creation time via WorkspaceHandle. We look
-    // it up live from Docker instead.
-    let _ = host_port;
     let container_id = workspace
         .container_id
         .ok_or_else(|| ServerError::BadRequest("workspace has no container".to_string()))?;
 
-    let host_port = resolve_host_port(&state.app_ctx.workspace_manager, &container_id).await?;
+    let host_port = resolve_port(&state.app_ctx.workspace_manager, &container_id, port_name.as_deref()).await?;
 
     // Best-effort activity bump: never block the proxied request on this.
     {
@@ -1493,19 +1509,32 @@ async fn user_has_repo_read_access(
     )
 }
 
-async fn resolve_host_port(
+/// Resolves the host port for a workspace container, either for an
+/// explicitly named port (`Some("http")`) or the workspace's default port
+/// (`None`). Returns a clear 404 if the container or the named port isn't
+/// found, rather than silently proxying to the wrong service.
+async fn resolve_port(
     workspace_manager: &dev_env::WorkspaceManager,
     container_id: &str,
+    port_name: Option<&str>,
 ) -> ServerResult<u16> {
     let handles = workspace_manager
         .list_workspaces("")
         .await
         .map_err(ServerError::DevEnv)?;
-    handles
+    let handle = handles
         .into_iter()
         .find(|h| h.container_id == container_id)
-        .map(|h| h.host_port)
-        .ok_or_else(|| ServerError::NotFound("workspace container not found".to_string()))
+        .ok_or_else(|| ServerError::NotFound("workspace container not found".to_string()))?;
+
+    match port_name {
+        Some(name) => handle.port(name).ok_or_else(|| {
+            ServerError::NotFound(format!("workspace has no port named '{name}'"))
+        }),
+        None => handle
+            .default_port()
+            .ok_or_else(|| ServerError::NotFound("workspace has no bound ports".to_string())),
+    }
 }
 
 // ---------------------------------------------------------------------

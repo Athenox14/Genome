@@ -12,11 +12,9 @@ use crate::types::{
     BranchProtectionRuleObject, DevWorkspaceObject, IssueCommentObject, IssueObject, LabelObject,
     MilestoneObject, NotificationObject, OrganizationObject,
     PrReviewCommentObject, PrReviewObject, ProjectCardObject, ProjectColumnObject, ProjectObject,
-    PullRequestObject, RepositoryObject, TwoFactorSetup, UserObject, WebhookObject,
+    PullRequestObject, RepositoryObject, UserObject, WebhookObject,
     WorkflowRunObject,
 };
-
-const TOTP_ISSUER: &str = "Genome";
 
 pub struct MutationRoot;
 
@@ -266,8 +264,8 @@ impl MutationRoot {
         let created_at = Utc::now();
         app.db
             .execute(
-                "INSERT INTO users (id, username, email, password_hash, is_admin, avatar_url, created_at, totp_secret, totp_enabled, deactivated_at) \
-                 VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5, NULL, 0, NULL)",
+                "INSERT INTO users (id, username, email, password_hash, is_admin, avatar_url, created_at, deactivated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5, NULL)",
                 params!(id.to_string(), username.clone(), email.clone(), password_hash.clone(), created_at.to_rfc3339()),
             )
             .await?;
@@ -280,8 +278,6 @@ impl MutationRoot {
             is_admin: false,
             avatar_url: None,
             created_at,
-            totp_secret: None,
-            totp_enabled: false,
             deactivated_at: None,
         };
         Ok(UserObject::from(user))
@@ -351,7 +347,6 @@ impl MutationRoot {
         ctx: &Context<'_>,
         username: String,
         password: String,
-        totp_code: Option<String>,
     ) -> async_graphql::Result<AuthPayload> {
         let app = ctx.data::<AppContext>()?;
         let user = app
@@ -375,20 +370,6 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("invalid username or password"));
         }
 
-        if user.totp_enabled {
-            let secret = user
-                .totp_secret
-                .as_deref()
-                .ok_or_else(|| async_graphql::Error::new("totp_required"))?;
-            match totp_code.as_deref() {
-                None => return Err(async_graphql::Error::new("totp_required")),
-                Some(code) if !auth::verify_totp(secret, code) => {
-                    return Err(async_graphql::Error::new("totp_invalid"));
-                }
-                _ => {}
-            }
-        }
-
         let token = auth::create_jwt(ClaimsInput::from(&user), &app.jwt_secret, 24 * 7)
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
@@ -396,97 +377,6 @@ impl MutationRoot {
             token,
             user: UserObject::from(user),
         })
-    }
-
-    /// Begins 2FA setup: generates a new TOTP secret, stores it on the
-    /// user's row (with `totp_enabled` still false until confirmed), and
-    /// returns the provisioning URI + raw secret for the frontend to render
-    /// as a QR code / manual-entry string.
-    async fn enable_two_factor(&self, ctx: &Context<'_>) -> async_graphql::Result<TwoFactorSetup> {
-        let app = ctx.data::<AppContext>()?;
-        let req = ctx.data::<RequestContext>()?;
-        let claims = require_user(req)?;
-
-        let user = app
-            .db
-            .query_as::<entity::user::Model, _>("SELECT * FROM users WHERE id = ?1", params!(claims.sub.to_string()))
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| async_graphql::Error::new("user not found"))?;
-
-        let secret = auth::generate_totp_secret();
-        let provisioning_uri = auth::totp_provisioning_uri(&secret, &user.username, TOTP_ISSUER);
-
-        app.db
-            .execute(
-                "UPDATE users SET totp_secret = ?1, totp_enabled = 0 WHERE id = ?2",
-                params!(secret.clone(), user.id.to_string()),
-            )
-            .await?;
-
-        Ok(TwoFactorSetup {
-            secret,
-            provisioning_uri,
-        })
-    }
-
-    /// Confirms 2FA setup by verifying a code against the pending secret
-    /// stored by `enableTwoFactor`, then flips `totp_enabled` to true.
-    async fn confirm_two_factor(&self, ctx: &Context<'_>, code: String) -> async_graphql::Result<bool> {
-        let app = ctx.data::<AppContext>()?;
-        let req = ctx.data::<RequestContext>()?;
-        let claims = require_user(req)?;
-
-        let user = app
-            .db
-            .query_as::<entity::user::Model, _>("SELECT * FROM users WHERE id = ?1", params!(claims.sub.to_string()))
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| async_graphql::Error::new("user not found"))?;
-
-        let secret = user
-            .totp_secret
-            .clone()
-            .ok_or_else(|| async_graphql::Error::new("no pending two-factor setup"))?;
-
-        if !auth::verify_totp(&secret, &code) {
-            return Err(async_graphql::Error::new("totp_invalid"));
-        }
-
-        app.db
-            .execute(
-                "UPDATE users SET totp_enabled = 1 WHERE id = ?1",
-                params!(user.id.to_string()),
-            )
-            .await?;
-
-        Ok(true)
-    }
-
-    /// Disables 2FA for the current user, clearing the stored secret.
-    async fn disable_two_factor(&self, ctx: &Context<'_>) -> async_graphql::Result<bool> {
-        let app = ctx.data::<AppContext>()?;
-        let req = ctx.data::<RequestContext>()?;
-        let claims = require_user(req)?;
-
-        let user = app
-            .db
-            .query_as::<entity::user::Model, _>("SELECT * FROM users WHERE id = ?1", params!(claims.sub.to_string()))
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| async_graphql::Error::new("user not found"))?;
-
-        app.db
-            .execute(
-                "UPDATE users SET totp_enabled = 0, totp_secret = NULL WHERE id = ?1",
-                params!(user.id.to_string()),
-            )
-            .await?;
-
-        Ok(true)
     }
 
     /// Grants or revokes site-admin status for a user. Restricted to
@@ -1983,10 +1873,16 @@ impl MutationRoot {
         Ok(WorkflowRunObject::from(run))
     }
 
+    /// Creates a dev workspace either from a named built-in template
+    /// (`template`, e.g. `"code-server"`/`"rust-dev"`/`"node-dev"`) or from a
+    /// raw `image` for advanced/custom use. `template` takes precedence if
+    /// both are given; a raw `image` with no `template` falls back to the
+    /// single-port code-server-only behavior that predates templates.
     async fn create_dev_workspace(
         &self,
         ctx: &Context<'_>,
         name: String,
+        template: Option<String>,
         image: Option<String>,
         repo_id: Option<Uuid>,
         auto_stop_minutes: Option<i32>,
@@ -1995,7 +1891,17 @@ impl MutationRoot {
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
 
-        let image = image.unwrap_or_else(|| dev_env::manager::IMAGE_CODE_SERVER.to_string());
+        let (image, ports): (String, &[(&str, u16)]) = if let Some(template_name) = template.as_deref() {
+            let template = dev_env::find_template(template_name).ok_or_else(|| {
+                async_graphql::Error::new(format!("unknown workspace template '{template_name}'"))
+            })?;
+            (template.image.to_string(), template.ports)
+        } else {
+            (
+                image.unwrap_or_else(|| dev_env::manager::IMAGE_CODE_SERVER.to_string()),
+                &[],
+            )
+        };
 
         let repo_clone_url = if let Some(rid) = repo_id {
             let repo = find_repo(app, rid).await?;
@@ -2015,6 +1921,7 @@ impl MutationRoot {
             .create_workspace(
                 &name,
                 &image,
+                ports,
                 repo_clone_url.as_deref(),
                 None,
                 None,
