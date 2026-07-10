@@ -303,11 +303,24 @@ async fn process_push_workflows(
                 }
             };
 
+            let archive = match app_ctx
+                .repo_manager
+                .archive_tree_at_ref(&owner, &repo, &new_sha)
+            {
+                Ok(archive) => archive,
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to archive tree for {owner}/{repo}@{new_sha}: {e}"
+                    );
+                    continue;
+                }
+            };
+
             for (_job_id, job) in workflow.jobs.iter() {
                 let env_extra = HashMap::new();
                 let executor = app_ctx.actions_executor.clone();
                 let job = job.clone();
-                let archive: Vec<u8> = Vec::new(); // no repo archive materialization available here
+                let archive = archive.clone();
                 let result = executor
                     .run_job(&job, &archive, env_extra, |line| {
                         tracing::info!("[workflow] {line}");

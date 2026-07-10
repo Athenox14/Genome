@@ -14,3 +14,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 bytes = "1"
 async-trait = "0.1"
+tar = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

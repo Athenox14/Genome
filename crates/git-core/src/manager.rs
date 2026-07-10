@@ -270,4 +270,125 @@ impl RepoManager {
 
         Ok(String::from_utf8(buf)?)
     }
+
+    /// Produce an in-memory tar archive of the full tree at `git_ref`,
+    /// recursively including every blob with its original file mode.
+    pub fn archive_tree_at_ref(&self, owner: &str, name: &str, git_ref: &str) -> Result<Vec<u8>> {
+        let (repo, _) = self.open(owner, name)?;
+        let commit = self.resolve_commit(&repo, git_ref)?;
+        let tree = commit.tree()?;
+
+        let mut builder = tar::Builder::new(Vec::new());
+        Self::write_tree_to_tar(&repo, &tree, "", &mut builder)?;
+
+        let data = builder.into_inner()?;
+        Ok(data)
+    }
+
+    /// Recursively walk `tree`, appending every blob it (transitively)
+    /// contains to `builder` as a tar entry under `prefix`.
+    fn write_tree_to_tar(
+        repo: &Repository,
+        tree: &git2::Tree,
+        prefix: &str,
+        builder: &mut tar::Builder<Vec<u8>>,
+    ) -> Result<()> {
+        for entry in tree.iter() {
+            let entry_name = entry.name().unwrap_or_default().to_string();
+            let full_path = format!("{prefix}{entry_name}");
+            match entry.kind() {
+                Some(ObjectType::Tree) => {
+                    let object = entry.to_object(repo)?;
+                    let subtree = object
+                        .as_tree()
+                        .ok_or_else(|| GitCoreError::PathNotFound(full_path.clone()))?;
+                    Self::write_tree_to_tar(repo, subtree, &format!("{full_path}/"), builder)?;
+                }
+                Some(ObjectType::Blob) => {
+                    let object = entry.to_object(repo)?;
+                    let blob = object
+                        .as_blob()
+                        .ok_or_else(|| GitCoreError::NotAFile(full_path.clone()))?;
+                    let mode = entry.filemode() as u32;
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(blob.content().len() as u64);
+                    header.set_mode(mode);
+                    header.set_cksum();
+                    builder.append_data(&mut header, &full_path, blob.content())?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read as _;
+
+    /// Create a fresh `RepoManager` rooted at a temp dir, plus a bare repo
+    /// under it with a single commit containing one file.
+    fn setup_repo_with_commit() -> (tempfile::TempDir, RepoManager, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = RepoManager::new(dir.path());
+        manager.init_repo("acme", "widgets").expect("init repo");
+        let repo_path = manager.repo_path("acme", "widgets").expect("repo path");
+        let repo = Repository::open_bare(&repo_path).expect("open bare repo");
+
+        let mut index = repo.index().expect("index");
+        let blob_oid = repo
+            .blob(b"hello from archive test\n")
+            .expect("write blob");
+        index
+            .add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                file_size: 24,
+                id: blob_oid,
+                flags: 0,
+                flags_extended: 0,
+                path: b"hello.txt".to_vec(),
+            })
+            .expect("add index entry");
+        let tree_oid = index.write_tree_to(&repo).expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let sig = git2::Signature::now("Test", "test@example.com").expect("signature");
+        let commit_oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[])
+            .expect("commit");
+
+        (dir, manager, commit_oid.to_string())
+    }
+
+    #[test]
+    fn archive_tree_at_ref_produces_expected_tar() {
+        let (_dir, manager, commit_sha) = setup_repo_with_commit();
+
+        let archive_bytes = manager
+            .archive_tree_at_ref("acme", "widgets", &commit_sha)
+            .expect("archive tree");
+
+        let mut archive = tar::Archive::new(archive_bytes.as_slice());
+        let entries = archive.entries().expect("entries");
+
+        let mut found = false;
+        for entry in entries {
+            let mut entry = entry.expect("entry");
+            let path = entry.path().expect("path").to_string_lossy().to_string();
+            if path == "hello.txt" {
+                let mut contents = String::new();
+                entry.read_to_string(&mut contents).expect("read entry");
+                assert_eq!(contents, "hello from archive test\n");
+                found = true;
+            }
+        }
+        assert!(found, "expected hello.txt entry in tar archive");
+    }
 }
