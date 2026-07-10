@@ -737,8 +737,15 @@ async fn run_check_push_protection(args: &[String]) -> anyhow::Result<i32> {
     let db = hiqlite::Client::remote(vec![api_addr], false, false, secret_api, false, None, None)
         .await?;
 
+    // `Client::remote(...)` (used above, since this CLI subcommand connects
+    // to the already-running server rather than starting its own Raft node)
+    // only supports `query_map` (`T: From<&mut Row>`), not `query_as`
+    // (`T: DeserializeOwned`) -- a real bug caught via dogfooding (pushing
+    // Genome's own repo to a running Genome instance with a branch
+    // protection rule set), see the `From<&mut Row>` impls on
+    // `entity::repository::Model`/`entity::branch_protection_rule::Model`.
     let repo_row = db
-        .query_as::<entity::repository::Model, _>(
+        .query_map::<entity::repository::Model, _>(
             "SELECT * FROM repositories WHERE name = ?1",
             params!(name.clone()),
         )
@@ -753,7 +760,7 @@ async fn run_check_push_protection(args: &[String]) -> anyhow::Result<i32> {
     };
 
     let rules = db
-        .query_as::<entity::branch_protection_rule::Model, _>(
+        .query_map::<entity::branch_protection_rule::Model, _>(
             "SELECT * FROM branch_protection_rules WHERE repo_id = ?1",
             params!(repo_row.id.to_string()),
         )

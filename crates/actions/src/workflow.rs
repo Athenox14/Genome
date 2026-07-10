@@ -86,12 +86,33 @@ pub struct TriggerMap {
 pub struct Job {
     #[serde(rename = "runs-on")]
     pub runs_on: String,
-    #[serde(default)]
+    /// GitHub Actions allows `needs: build` (bare string) as shorthand for
+    /// `needs: [build]` -- found via dogfooding Genome's own
+    /// `.github/workflows/docker-publish.yml`, which uses the bare-string
+    /// form and failed to parse before this was added.
+    #[serde(default, deserialize_with = "deserialize_needs")]
     pub needs: Option<Vec<String>>,
     #[serde(default)]
     pub steps: Vec<Step>,
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
+}
+
+fn deserialize_needs<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NeedsValue {
+        Single(String),
+        Many(Vec<String>),
+    }
+    let opt: Option<NeedsValue> = Option::deserialize(deserializer)?;
+    Ok(opt.map(|v| match v {
+        NeedsValue::Single(s) => vec![s],
+        NeedsValue::Many(v) => v,
+    }))
 }
 
 /// A single step within a job.
