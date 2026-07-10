@@ -1,7 +1,9 @@
 use async_graphql::{Context, Object};
 use auth::{Claims, ClaimsInput, Permission};
 use chrono::Utc;
+use regex::Regex;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 use crate::context::{AppContext, RequestContext};
@@ -11,6 +13,51 @@ use crate::types::{
 };
 
 pub struct MutationRoot;
+
+fn username_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[a-zA-Z0-9_-]{3,32}$").unwrap())
+}
+
+fn email_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[^@\s]+@[^@\s]+\.[^@\s]+$").unwrap())
+}
+
+/// Validates a registration username: safe to use as a directory name via
+/// git-core (no path separators, no leading dot, restricted character set).
+fn validate_username(username: &str) -> async_graphql::Result<()> {
+    if !username_regex().is_match(username) {
+        return Err(async_graphql::Error::new(
+            "username must be 3-32 characters and contain only letters, digits, '_' or '-'",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_email(email: &str) -> async_graphql::Result<()> {
+    if !email.contains('@') || !email_regex().is_match(email) {
+        return Err(async_graphql::Error::new("invalid email address"));
+    }
+    Ok(())
+}
+
+fn validate_password(password: &str) -> async_graphql::Result<()> {
+    if password.len() < 8 {
+        return Err(async_graphql::Error::new(
+            "password must be at least 8 characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a name used as a filesystem path component (repository or
+/// organization name), mirroring `git_core::validate_slug` but surfaced as a
+/// clear GraphQL error instead of a lower-level `GitCoreError`.
+fn validate_name_slug(name: &str) -> async_graphql::Result<()> {
+    git_core::validate_slug(name)
+        .map_err(|_| async_graphql::Error::new(format!("invalid name: '{name}'")))
+}
 
 fn require_user<'a>(req: &'a RequestContext) -> async_graphql::Result<&'a Claims> {
     req.user
@@ -73,6 +120,10 @@ impl MutationRoot {
         email: String,
         password: String,
     ) -> async_graphql::Result<UserObject> {
+        validate_username(&username)?;
+        validate_email(&email)?;
+        validate_password(&password)?;
+
         let app = ctx.data::<AppContext>()?;
         let password_hash = auth::hash_password(&password)
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
@@ -126,6 +177,8 @@ impl MutationRoot {
         description: Option<String>,
         is_private: bool,
     ) -> async_graphql::Result<RepositoryObject> {
+        validate_name_slug(&name)?;
+
         let app = ctx.data::<AppContext>()?;
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
@@ -410,6 +463,8 @@ impl MutationRoot {
         name: String,
         description: Option<String>,
     ) -> async_graphql::Result<OrganizationObject> {
+        validate_name_slug(&name)?;
+
         let app = ctx.data::<AppContext>()?;
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;

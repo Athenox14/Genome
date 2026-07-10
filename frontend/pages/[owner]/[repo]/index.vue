@@ -1,21 +1,21 @@
 <script setup lang="ts">
-import { REPO_OVERVIEW_QUERY, REPO_TREE_QUERY, REPO_README_QUERY } from '~/graphql/documents'
+import { REPO_OVERVIEW_QUERY, REPO_TREE_QUERY } from '~/graphql/documents'
 
 interface TreeEntry {
   path: string
   name: string
-  type: 'file' | 'dir' | string
+  kind: 'file' | 'dir' | string
   size: number | null
+  oid: string
 }
 
 interface RepoOverview {
   id: string
+  ownerType: string
+  ownerId: string
   name: string
-  owner: string
   description: string | null
   defaultBranch: string
-  cloneUrlHttp: string
-  cloneUrlSsh: string | null
   branches: { name: string }[]
 }
 
@@ -27,7 +27,6 @@ const { $urql } = useNuxtApp()
 
 const overview = ref<RepoOverview | null>(null)
 const tree = ref<TreeEntry[]>([])
-const readme = ref<string | null>(null)
 const currentPath = ref('')
 const currentRef = ref('')
 const loading = ref(true)
@@ -48,26 +47,22 @@ async function loadTree() {
       owner: owner.value,
       repo: repoName.value,
       ref: currentRef.value,
-      path: currentPath.value || null
+      path: currentPath.value
     })
     .toPromise()
   if (result.error) throw result.error
-  tree.value = result.data?.repoTree ?? []
+  tree.value = result.data?.repository?.tree ?? []
 }
 
-async function loadReadme() {
-  const result = await $urql
-    .query(REPO_README_QUERY, { owner: owner.value, repo: repoName.value, ref: currentRef.value })
-    .toPromise()
-  readme.value = result.data?.repoFileContent?.content ?? null
-}
+// NOTE: the backend has no file-content resolver (no `repoFileContent`
+// query), so README rendering is not currently possible from this API.
 
 async function loadAll() {
   loading.value = true
   error.value = null
   try {
     await loadOverview()
-    await Promise.all([loadTree(), loadReadme()])
+    await loadTree()
   } catch (err: any) {
     error.value = err?.message || 'Failed to load repository'
   } finally {
@@ -76,7 +71,7 @@ async function loadAll() {
 }
 
 function openEntry(entry: TreeEntry) {
-  if (entry.type === 'dir') {
+  if (entry.kind === 'dir') {
     currentPath.value = entry.path
     loadTree()
   }
@@ -91,7 +86,6 @@ function goUp() {
 
 function onBranchChange() {
   loadTree()
-  loadReadme()
 }
 
 onMounted(loadAll)
@@ -106,7 +100,7 @@ onMounted(loadAll)
       <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 class="text-xl font-semibold text-gray-900 dark:text-white">
-            {{ overview.owner }}/{{ overview.name }}
+            {{ owner }}/{{ overview.name }}
           </h1>
           <p v-if="overview.description" class="text-sm text-gray-600 dark:text-gray-400">
             {{ overview.description }}
@@ -137,11 +131,6 @@ onMounted(loadAll)
         </NuxtLink>
       </div>
 
-      <div class="mb-4 rounded border border-gray-200 bg-white p-3 text-sm dark:bg-gray-900 dark:border-gray-800">
-        <span class="font-medium text-gray-700 dark:text-gray-300">Clone: </span>
-        <code class="rounded bg-gray-100 px-2 py-1 dark:bg-gray-800">{{ overview.cloneUrlHttp }}</code>
-      </div>
-
       <div class="rounded border border-gray-200 bg-white dark:bg-gray-900 dark:border-gray-800">
         <div class="flex items-center gap-2 border-b border-gray-200 p-2 text-sm dark:border-gray-800">
           <button v-if="currentPath" class="text-blue-600 hover:underline" @click="goUp">.. (up)</button>
@@ -154,15 +143,10 @@ onMounted(loadAll)
             class="cursor-pointer p-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800"
             @click="openEntry(entry)"
           >
-            <span>{{ entry.type === 'dir' ? '📁' : '📄' }}</span>
+            <span>{{ entry.kind === 'dir' ? '📁' : '📄' }}</span>
             {{ entry.name }}
           </li>
         </ul>
-      </div>
-
-      <div v-if="readme" class="mt-6 rounded border border-gray-200 bg-white p-4 dark:bg-gray-900 dark:border-gray-800">
-        <h2 class="mb-2 text-sm font-semibold text-gray-700 dark:text-gray-300">README.md</h2>
-        <pre class="whitespace-pre-wrap text-sm text-gray-800 dark:text-gray-200">{{ readme }}</pre>
       </div>
     </template>
   </div>

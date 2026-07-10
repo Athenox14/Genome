@@ -1,12 +1,15 @@
 mod config;
 mod error;
+mod rate_limit;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -54,6 +57,15 @@ async fn main() -> anyhow::Result<()> {
     let schema = graphql_api::build_schema(app_ctx.clone());
 
     let state = ServerState { schema, app_ctx };
+    let limiter = rate_limit::RateLimiter::new();
+
+    // CORS is intentionally permissive (the frontend runs on a different
+    // port/origin by design). `CorsLayer::permissive()` allows any origin,
+    // method, and header, but does NOT call `.allow_credentials(true)` — so
+    // the insecure "wildcard origin + credentials" combination (invalid per
+    // the Fetch spec) is never enabled. Do not add `.allow_credentials(true)`
+    // to this layer without also restricting `allow_origin` to a fixed list.
+    let cors = CorsLayer::permissive();
 
     let app = Router::new()
         .route(
@@ -77,13 +89,21 @@ async fn main() -> anyhow::Result<()> {
             "/workspaces/:id/proxy/*path",
             get(workspace_proxy_handler).post(workspace_proxy_handler),
         )
+        .layer(middleware::from_fn_with_state(
+            limiter,
+            rate_limit::rate_limit_middleware,
+        ))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     tracing::info!("listening on {}", config.listen_addr);
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

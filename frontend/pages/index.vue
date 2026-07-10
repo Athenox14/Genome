@@ -3,16 +3,28 @@ import { MY_REPOSITORIES_QUERY, CREATE_REPOSITORY_MUTATION } from '~/graphql/doc
 
 interface Repository {
   id: string
+  ownerType: string
+  ownerId: string
   name: string
-  owner: string
   description: string | null
   isPrivate: boolean
   defaultBranch: string
-  updatedAt: string
-  starCount: number
+  createdAt: string
 }
 
 const { $urql } = useNuxtApp()
+const authStore = useAuthStore()
+
+// RepositoryObject does not expose an owner login (it's `#[graphql(skip)]`
+// on the backend). For repos owned directly by the current user we can use
+// their username; for org-owned or collaborator repos there is currently no
+// way to resolve the login from this query alone.
+function ownerSlug(repo: Repository): string {
+  if (repo.ownerType === 'user' && repo.ownerId === authStore.user?.id) {
+    return authStore.user?.username || repo.ownerId
+  }
+  return repo.ownerId
+}
 
 const repos = ref<Repository[]>([])
 const loading = ref(true)
@@ -46,7 +58,7 @@ async function createRepo() {
       .mutation(CREATE_REPOSITORY_MUTATION, {
         name: newRepoName.value,
         description: newRepoDescription.value || null,
-        isPrivate: newRepoPrivate.value
+        isPrivate: !!newRepoPrivate.value
       })
       .toPromise()
     if (result.error) throw result.error
@@ -113,8 +125,8 @@ onMounted(loadRepos)
     <ul v-else class="divide-y divide-gray-200 rounded border border-gray-200 bg-white dark:bg-gray-900 dark:border-gray-800">
       <li v-if="repos.length === 0" class="p-4 text-sm text-gray-500">No repositories yet.</li>
       <li v-for="repo in repos" :key="repo.id" class="p-4 hover:bg-gray-50 dark:hover:bg-gray-800">
-        <NuxtLink :to="`/${repo.owner}/${repo.name}`" class="font-medium text-blue-600 hover:underline">
-          {{ repo.owner }}/{{ repo.name }}
+        <NuxtLink :to="`/${ownerSlug(repo)}/${repo.name}`" class="font-medium text-blue-600 hover:underline">
+          {{ ownerSlug(repo) }}/{{ repo.name }}
         </NuxtLink>
         <span v-if="repo.isPrivate" class="ml-2 rounded bg-gray-200 px-1.5 py-0.5 text-xs text-gray-700 dark:bg-gray-700 dark:text-gray-200">
           Private

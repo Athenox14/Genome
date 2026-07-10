@@ -9,9 +9,9 @@ import {
 interface DevWorkspace {
   id: string
   name: string
-  repository: string | null
+  repoId: string | null
+  image: string
   status: string
-  proxyUrl: string | null
   createdAt: string
 }
 
@@ -23,8 +23,7 @@ const error = ref<string | null>(null)
 
 const showForm = ref(false)
 const newName = ref('')
-const newRepository = ref('')
-const newBranch = ref('')
+const newImage = ref('')
 const creating = ref(false)
 const pendingActionId = ref<string | null>(null)
 
@@ -56,15 +55,14 @@ async function createWorkspace() {
     const result = await $urql
       .mutation(CREATE_DEV_WORKSPACE_MUTATION, {
         name: newName.value,
-        repository: newRepository.value || null,
-        branch: newBranch.value || null
+        image: newImage.value || null,
+        repoId: null
       })
       .toPromise()
     if (result.error) throw result.error
     showForm.value = false
     newName.value = ''
-    newRepository.value = ''
-    newBranch.value = ''
+    newImage.value = ''
     await loadWorkspaces()
   } catch (err: any) {
     error.value = err?.message || 'Failed to create workspace'
@@ -76,7 +74,7 @@ async function createWorkspace() {
 async function startWorkspace(id: string) {
   pendingActionId.value = id
   try {
-    const result = await $urql.mutation(START_DEV_WORKSPACE_MUTATION, { id }).toPromise()
+    const result = await $urql.mutation(START_DEV_WORKSPACE_MUTATION, { workspaceId: id }).toPromise()
     if (result.error) throw result.error
     await loadWorkspaces()
   } catch (err: any) {
@@ -89,7 +87,7 @@ async function startWorkspace(id: string) {
 async function stopWorkspace(id: string) {
   pendingActionId.value = id
   try {
-    const result = await $urql.mutation(STOP_DEV_WORKSPACE_MUTATION, { id }).toPromise()
+    const result = await $urql.mutation(STOP_DEV_WORKSPACE_MUTATION, { workspaceId: id }).toPromise()
     if (result.error) throw result.error
     await loadWorkspaces()
   } catch (err: any) {
@@ -123,13 +121,8 @@ onMounted(loadWorkspaces)
           class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
         />
         <input
-          v-model="newRepository"
-          placeholder="Repository (owner/repo, optional)"
-          class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
-        />
-        <input
-          v-model="newBranch"
-          placeholder="Branch (optional)"
+          v-model="newImage"
+          placeholder="Container image (optional)"
           class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
         />
         <button
@@ -153,7 +146,7 @@ onMounted(loadWorkspaces)
             {{ ws.status }}
           </span>
           <span class="font-medium text-gray-900 dark:text-white">{{ ws.name }}</span>
-          <span v-if="ws.repository" class="ml-2 text-xs text-gray-500">{{ ws.repository }}</span>
+          <span v-if="ws.repoId" class="ml-2 text-xs text-gray-500">{{ ws.repoId }}</span>
         </div>
         <div class="flex items-center gap-2">
           <button

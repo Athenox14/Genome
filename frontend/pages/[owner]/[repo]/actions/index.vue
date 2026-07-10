@@ -3,13 +3,12 @@ import { WORKFLOW_RUNS_QUERY } from '~/graphql/documents'
 
 interface WorkflowRun {
   id: string
-  runNumber: number
   workflowName: string
   status: string
-  conclusion: string | null
-  branch: string
+  event: string
   commitSha: string
-  createdAt: string
+  startedAt: string | null
+  finishedAt: string | null
 }
 
 const route = useRoute()
@@ -23,10 +22,10 @@ const loading = ref(true)
 const error = ref<string | null>(null)
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
-function statusBadgeClass(status: string, conclusion: string | null) {
-  if (status === 'in_progress' || status === 'queued') return 'bg-yellow-100 text-yellow-700'
-  if (conclusion === 'success') return 'bg-green-100 text-green-700'
-  if (conclusion === 'failure') return 'bg-red-100 text-red-700'
+function statusBadgeClass(status: string) {
+  if (status === 'queued' || status === 'in_progress') return 'bg-yellow-100 text-yellow-700'
+  if (status === 'success') return 'bg-green-100 text-green-700'
+  if (status === 'failure' || status === 'error') return 'bg-red-100 text-red-700'
   return 'bg-gray-100 text-gray-700'
 }
 
@@ -37,7 +36,7 @@ async function loadRuns() {
       .query(WORKFLOW_RUNS_QUERY, { owner: owner.value, repo: repoName.value })
       .toPromise()
     if (result.error) throw result.error
-    runs.value = result.data?.workflowRuns ?? []
+    runs.value = result.data?.repository?.workflowRuns ?? []
   } catch (err: any) {
     error.value = err?.message || 'Failed to load workflow runs'
   } finally {
@@ -75,15 +74,15 @@ onBeforeUnmount(() => {
           <div>
             <span
               class="mr-2 rounded px-1.5 py-0.5 text-xs font-medium"
-              :class="statusBadgeClass(run.status, run.conclusion)"
+              :class="statusBadgeClass(run.status)"
             >
-              {{ run.conclusion || run.status }}
+              {{ run.status }}
             </span>
             <span class="font-medium text-gray-900 dark:text-white">
-              {{ run.workflowName }} #{{ run.runNumber }}
+              {{ run.workflowName }}
             </span>
             <p class="text-xs text-gray-500">
-              {{ run.branch }} @ {{ run.commitSha.slice(0, 7) }}
+              {{ run.event }} @ {{ run.commitSha.slice(0, 7) }}
             </p>
           </div>
         </NuxtLink>

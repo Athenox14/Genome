@@ -6,9 +6,8 @@ interface Issue {
   number: number
   title: string
   state: string
-  author: { username: string } | null
+  authorId: string
   createdAt: string
-  commentCount: number
 }
 
 const route = useRoute()
@@ -18,6 +17,7 @@ const repoName = computed(() => String(route.params.repo))
 const { $urql } = useNuxtApp()
 
 const issues = ref<Issue[]>([])
+const repoId = ref<string | null>(null)
 const loading = ref(true)
 const error = ref<string | null>(null)
 
@@ -34,7 +34,8 @@ async function loadIssues() {
       .query(ISSUES_QUERY, { owner: owner.value, repo: repoName.value })
       .toPromise()
     if (result.error) throw result.error
-    issues.value = result.data?.issues ?? []
+    repoId.value = result.data?.repository?.id ?? null
+    issues.value = result.data?.repository?.issues ?? []
   } catch (err: any) {
     error.value = err?.message || 'Failed to load issues'
   } finally {
@@ -43,13 +44,12 @@ async function loadIssues() {
 }
 
 async function createIssue() {
-  if (!title.value.trim()) return
+  if (!title.value.trim() || !repoId.value) return
   submitting.value = true
   try {
     const result = await $urql
       .mutation(CREATE_ISSUE_MUTATION, {
-        owner: owner.value,
-        repo: repoName.value,
+        repoId: repoId.value,
         title: title.value,
         body: body.value || null
       })
@@ -121,11 +121,7 @@ onMounted(loadIssues)
             {{ issue.state }}
           </span>
           <span class="font-medium text-gray-900 dark:text-white">#{{ issue.number }} {{ issue.title }}</span>
-          <p class="text-xs text-gray-500">
-            opened by {{ issue.author?.username || 'unknown' }}
-          </p>
         </div>
-        <span class="text-xs text-gray-500">{{ issue.commentCount }} comments</span>
       </li>
     </ul>
   </div>

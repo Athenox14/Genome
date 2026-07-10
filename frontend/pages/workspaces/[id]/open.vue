@@ -5,7 +5,6 @@ interface DevWorkspace {
   id: string
   name: string
   status: string
-  proxyUrl: string | null
 }
 
 const route = useRoute()
@@ -18,12 +17,11 @@ const workspace = ref<DevWorkspace | null>(null)
 const loading = ref(true)
 const error = ref<string | null>(null)
 
-// The backend proxies the code-server instance for a running workspace.
-// Best guess: `${apiBase}/workspaces/{id}/proxy/` if the GraphQL type doesn't
-// return an explicit proxyUrl.
+// DevWorkspaceObject has no `proxyUrl` field on the backend; the code-server
+// instance is reached through the API's workspace proxy route directly.
 const iframeSrc = computed(() => {
   if (!workspace.value) return null
-  return workspace.value.proxyUrl || `${config.public.apiBase}/workspaces/${workspace.value.id}/proxy/`
+  return `${config.public.apiBase}/workspaces/${workspace.value.id}/proxy/`
 })
 
 async function loadWorkspace() {

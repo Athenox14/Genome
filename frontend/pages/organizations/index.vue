@@ -5,7 +5,7 @@ interface Organization {
   id: string
   name: string
   description: string | null
-  memberCount: number
+  createdAt: string
 }
 
 const { $urql } = useNuxtApp()
@@ -97,7 +97,6 @@ onMounted(loadOrganizations)
       <li v-if="organizations.length === 0" class="p-4 text-sm text-gray-500">No organizations yet.</li>
       <li v-for="org in organizations" :key="org.id" class="p-4">
         <span class="font-medium text-gray-900 dark:text-white">{{ org.name }}</span>
-        <span class="ml-2 text-xs text-gray-500">{{ org.memberCount }} members</span>
         <p v-if="org.description" class="mt-1 text-sm text-gray-600 dark:text-gray-400">{{ org.description }}</p>
       </li>
     </ul>

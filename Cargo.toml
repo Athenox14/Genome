@@ -40,3 +40,5 @@ serde_yaml = "0.9"
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 futures-util = "0.3"
 tar = "0.4"
+regex = "1"
+dashmap = "6"

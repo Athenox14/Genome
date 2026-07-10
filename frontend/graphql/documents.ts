@@ -1,30 +1,48 @@
 /**
- * Plain GraphQL document strings (no codegen), covering the best-guess
- * Genome schema shape. Backend team: please align field names with these
- * where reasonable, or tell us what changed.
+ * Plain GraphQL document strings (no codegen), aligned to the real backend
+ * schema in crates/graphql-api/src/{query,mutation,types}.rs.
+ *
+ * Notes on schema shape:
+ * - RepositoryObject does NOT expose an `owner` login string (owner_login is
+ *   `#[graphql(skip)]`). Only `ownerType` + `ownerId` are available. Callers
+ *   that need a slug (e.g. `/{owner}/{repo}` links) must derive it from the
+ *   current user (for own repos) or a separate `organization`/`user` lookup.
+ * - Issues/PullRequests/WorkflowRuns/Branches/Tree/Commits are only
+ *   reachable as nested fields on `repository(owner, name)`, not as root
+ *   query fields.
+ * - IssueObject/PullRequestObject only expose `authorId` (no nested author
+ *   object) and have no comment/job sub-resolvers.
+ * - There is no single `workflowRun(id)` query, and WorkflowRunObject has no
+ *   `jobs`, `runNumber`, `conclusion`, or `branch` fields.
+ * - DevWorkspaceObject has no `proxyUrl` or `repository` (string) field;
+ *   it has `repoId` (UUID) and `image`.
+ * - Mutations that touch a repo (createIssue, createPullRequest,
+ *   triggerWorkflowDispatch, addCollaborator, deleteRepository) take a
+ *   `repoId: UUID!`, not owner/repo strings.
  */
 
 export const MY_REPOSITORIES_QUERY = /* GraphQL */ `
   query MyRepositories {
     myRepositories {
       id
+      ownerType
+      ownerId
       name
-      owner
       description
       isPrivate
       defaultBranch
-      updatedAt
-      starCount
+      createdAt
     }
   }
 `
 
 export const CREATE_REPOSITORY_MUTATION = /* GraphQL */ `
-  mutation CreateRepository($name: String!, $description: String, $isPrivate: Boolean) {
+  mutation CreateRepository($name: String!, $description: String, $isPrivate: Boolean!) {
     createRepository(name: $name, description: $description, isPrivate: $isPrivate) {
       id
+      ownerType
+      ownerId
       name
-      owner
     }
   }
 `
@@ -33,12 +51,11 @@ export const REPO_OVERVIEW_QUERY = /* GraphQL */ `
   query RepoOverview($owner: String!, $repo: String!) {
     repository(owner: $owner, name: $repo) {
       id
+      ownerType
+      ownerId
       name
-      owner
       description
       defaultBranch
-      cloneUrlHttp
-      cloneUrlSsh
       branches {
         name
       }
@@ -47,44 +64,38 @@ export const REPO_OVERVIEW_QUERY = /* GraphQL */ `
 `
 
 export const REPO_TREE_QUERY = /* GraphQL */ `
-  query RepoTree($owner: String!, $repo: String!, $ref: String!, $path: String) {
-    repoTree(owner: $owner, repo: $repo, ref: $ref, path: $path) {
-      path
-      name
-      type
-      size
-    }
-  }
-`
-
-export const REPO_README_QUERY = /* GraphQL */ `
-  query RepoReadme($owner: String!, $repo: String!, $ref: String!) {
-    repoFileContent(owner: $owner, repo: $repo, ref: $ref, path: "README.md") {
-      content
-      encoding
+  query RepoTree($owner: String!, $repo: String!, $ref: String!, $path: String!) {
+    repository(owner: $owner, name: $repo) {
+      tree(ref: $ref, path: $path) {
+        name
+        path
+        kind
+        size
+        oid
+      }
     }
   }
 `
 
 export const ISSUES_QUERY = /* GraphQL */ `
   query Issues($owner: String!, $repo: String!) {
-    issues(owner: $owner, repo: $repo) {
+    repository(owner: $owner, name: $repo) {
       id
-      number
-      title
-      state
-      author {
-        username
+      issues {
+        id
+        number
+        title
+        state
+        authorId
+        createdAt
       }
-      createdAt
-      commentCount
     }
   }
 `
 
 export const CREATE_ISSUE_MUTATION = /* GraphQL */ `
-  mutation CreateIssue($owner: String!, $repo: String!, $title: String!, $body: String) {
-    createIssue(owner: $owner, repo: $repo, title: $title, body: $body) {
+  mutation CreateIssue($repoId: UUID!, $title: String!, $body: String) {
+    createIssue(repoId: $repoId, title: $title, body: $body) {
       id
       number
       title
@@ -94,53 +105,45 @@ export const CREATE_ISSUE_MUTATION = /* GraphQL */ `
 
 export const PULL_REQUESTS_QUERY = /* GraphQL */ `
   query PullRequests($owner: String!, $repo: String!) {
-    pullRequests(owner: $owner, repo: $repo) {
+    repository(owner: $owner, name: $repo) {
       id
-      number
-      title
-      state
-      sourceBranch
-      targetBranch
-      author {
-        username
+      pullRequests {
+        id
+        number
+        title
+        state
+        sourceBranch
+        targetBranch
+        authorId
+        createdAt
       }
-      createdAt
     }
   }
 `
 
 export const WORKFLOW_RUNS_QUERY = /* GraphQL */ `
   query WorkflowRuns($owner: String!, $repo: String!) {
-    workflowRuns(owner: $owner, repo: $repo) {
+    repository(owner: $owner, name: $repo) {
       id
-      runNumber
-      workflowName
-      status
-      conclusion
-      branch
-      commitSha
-      createdAt
+      workflowRuns {
+        id
+        workflowName
+        status
+        event
+        commitSha
+        startedAt
+        finishedAt
+      }
     }
   }
 `
 
-export const WORKFLOW_RUN_QUERY = /* GraphQL */ `
-  query WorkflowRun($owner: String!, $repo: String!, $runId: ID!) {
-    workflowRun(owner: $owner, repo: $repo, id: $runId) {
+export const TRIGGER_WORKFLOW_DISPATCH_MUTATION = /* GraphQL */ `
+  mutation TriggerWorkflowDispatch($repoId: UUID!, $workflowPath: String!) {
+    triggerWorkflowDispatch(repoId: $repoId, workflowPath: $workflowPath) {
       id
-      runNumber
       workflowName
       status
-      conclusion
-      branch
-      commitSha
-      jobs {
-        id
-        name
-        status
-        conclusion
-        logs
-      }
     }
   }
 `
@@ -149,18 +152,18 @@ export const DEV_WORKSPACES_QUERY = /* GraphQL */ `
   query DevWorkspaces {
     devWorkspaces {
       id
+      repoId
       name
-      repository
+      image
       status
-      proxyUrl
       createdAt
     }
   }
 `
 
 export const CREATE_DEV_WORKSPACE_MUTATION = /* GraphQL */ `
-  mutation CreateDevWorkspace($name: String!, $repository: String, $branch: String) {
-    createDevWorkspace(name: $name, repository: $repository, branch: $branch) {
+  mutation CreateDevWorkspace($name: String!, $image: String, $repoId: UUID) {
+    createDevWorkspace(name: $name, image: $image, repoId: $repoId) {
       id
       name
       status
@@ -169,21 +172,26 @@ export const CREATE_DEV_WORKSPACE_MUTATION = /* GraphQL */ `
 `
 
 export const START_DEV_WORKSPACE_MUTATION = /* GraphQL */ `
-  mutation StartDevWorkspace($id: ID!) {
-    startDevWorkspace(id: $id) {
+  mutation StartDevWorkspace($workspaceId: UUID!) {
+    startDevWorkspace(workspaceId: $workspaceId) {
       id
       status
-      proxyUrl
     }
   }
 `
 
 export const STOP_DEV_WORKSPACE_MUTATION = /* GraphQL */ `
-  mutation StopDevWorkspace($id: ID!) {
-    stopDevWorkspace(id: $id) {
+  mutation StopDevWorkspace($workspaceId: UUID!) {
+    stopDevWorkspace(workspaceId: $workspaceId) {
       id
       status
     }
+  }
+`
+
+export const DELETE_DEV_WORKSPACE_MUTATION = /* GraphQL */ `
+  mutation DeleteDevWorkspace($workspaceId: UUID!) {
+    deleteDevWorkspace(workspaceId: $workspaceId)
   }
 `
 
@@ -193,7 +201,7 @@ export const ORGANIZATIONS_QUERY = /* GraphQL */ `
       id
       name
       description
-      memberCount
+      createdAt
     }
   }
 `

@@ -8,7 +8,7 @@ interface PullRequest {
   state: string
   sourceBranch: string
   targetBranch: string
-  author: { username: string } | null
+  authorId: string
   createdAt: string
 }
 
@@ -30,7 +30,7 @@ async function loadPulls() {
       .query(PULL_REQUESTS_QUERY, { owner: owner.value, repo: repoName.value })
       .toPromise()
     if (result.error) throw result.error
-    pulls.value = result.data?.pullRequests ?? []
+    pulls.value = result.data?.repository?.pullRequests ?? []
   } catch (err: any) {
     error.value = err?.message || 'Failed to load pull requests'
   } finally {
@@ -61,7 +61,7 @@ onMounted(loadPulls)
         </span>
         <span class="font-medium text-gray-900 dark:text-white">#{{ pr.number }} {{ pr.title }}</span>
         <p class="text-xs text-gray-500">
-          {{ pr.sourceBranch }} → {{ pr.targetBranch }} by {{ pr.author?.username || 'unknown' }}
+          {{ pr.sourceBranch }} → {{ pr.targetBranch }}
         </p>
       </li>
     </ul>
