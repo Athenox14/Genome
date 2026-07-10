@@ -30,7 +30,7 @@ Rust workspace, one crate per concern:
 | `migration` | Hiqlite (embedded, Raft-replicated SQLite) migrations |
 | `git-core` | Bare repo storage, smart-HTTP transport, wiki, merge (merge/squash/rebase), branch protection ancestry checks |
 | `ssh-server` | git-over-SSH (russh), pubkey auth against registered SSH keys |
-| `auth` | JWT, PAT hashing, argon2 password hashing, TOTP 2FA, permission model |
+| `auth` | JWT, PAT hashing, argon2 password hashing, permission model |
 | `actions` | GitHub-Actions-compatible workflow YAML parser + Docker-based job executor, encrypted secrets |
 | `dev-env` | Coder-like containerized dev workspaces (bollard/Docker), auto-stop scheduling |
 | `webhooks` | HMAC-signed webhook dispatch |
@@ -132,8 +132,7 @@ server`) if you only need the API/git/CI surface.
 
 Every user-facing action is a GraphQL mutation/query at `POST /graphql`.
 Authenticate with either:
-- `Authorization: Bearer <jwt>` — from the `login` mutation (supports TOTP via
-  an optional `totpCode` argument).
+- `Authorization: Bearer <jwt>` — from the `login` mutation.
 - `Authorization: token <pat>` — from a personal access token created via
   `createAccessToken` (this is the intended path for pure API/automation use,
   since it doesn't require a login session).
@@ -185,9 +184,12 @@ GitHub Actions-compatible: `run:` steps and `actions/checkout` work,
 `genome/upload-artifact` with `with: { name, path }` to publish a build
 artifact, downloadable via `GET /artifacts/:id/download`).
 
-Dev workspaces: `createDevWorkspace` (optional `autoStopMinutes`),
+Dev workspaces: `createDevWorkspace` (optional `template` — `"code-server"`,
+`"rust-dev"`, `"node-dev"` — or a raw `image`; optional `autoStopMinutes`),
 `startDevWorkspace`, `stopDevWorkspace`, `deleteDevWorkspace`,
-`execInDevWorkspace`.
+`execInDevWorkspace`. Reachable via `GET /workspaces/:id/proxy/*path`
+(default port) or `GET /workspaces/:id/proxy_port/:portName/*path` (named
+port).
 
 Admin: `adminListUsers`, `adminSetUserAdmin`, `adminDeactivateUser`,
 `adminAllDevWorkspaces`.

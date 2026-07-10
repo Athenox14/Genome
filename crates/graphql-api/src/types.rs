@@ -808,15 +808,6 @@ impl From<entity::pr_review_comment::Model> for PrReviewCommentObject {
     }
 }
 
-/// Returned by `enableTwoFactor`: the frontend renders `provisioning_uri` as
-/// a QR code (or shows `secret` for manual entry), then the user confirms
-/// with a code via `confirmTwoFactor`.
-#[derive(SimpleObject, Clone)]
-pub struct TwoFactorSetup {
-    pub secret: String,
-    pub provisioning_uri: String,
-}
-
 #[derive(SimpleObject, Clone)]
 pub struct LabelObject {
     pub id: Uuid,

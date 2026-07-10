@@ -21,13 +21,38 @@ pub const IMAGE_UBUNTU: &str = "ubuntu:22.04";
 
 const LABEL_WORKSPACE: &str = "genome.workspace";
 const LABEL_OWNER: &str = "genome.owner";
-const CODE_SERVER_PORT: &str = "8080/tcp";
+/// Prefix used for per-container-port labels, e.g. `genome.port.http=8080`,
+/// so that named port -> container port mappings survive a daemon restart
+/// and can be reconstructed purely from `docker inspect`/`list_containers`.
+const LABEL_PORT_PREFIX: &str = "genome.port.";
+/// Fallback port binding used when a caller supplies a raw `image` with no
+/// explicit port list, preserving the pre-template single-port behavior.
+const DEFAULT_PORT_NAME: &str = "http";
+const DEFAULT_CONTAINER_PORT: u16 = 8080;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceHandle {
     pub container_id: String,
-    pub host_port: u16,
+    /// Named container port -> host port, e.g. `{"http": 41231}`.
+    pub ports: HashMap<String, u16>,
     pub name: String,
+}
+
+impl WorkspaceHandle {
+    /// Returns the host port for the given named port, if bound.
+    pub fn port(&self, name: &str) -> Option<u16> {
+        self.ports.get(name).copied()
+    }
+
+    /// Returns the "http" port if present, else the first bound port
+    /// (arbitrary but stable given a `HashMap` iteration for a single-entry
+    /// map, which is the common case).
+    pub fn default_port(&self) -> Option<u16> {
+        self.ports
+            .get(DEFAULT_PORT_NAME)
+            .copied()
+            .or_else(|| self.ports.values().next().copied())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +106,9 @@ impl WorkspaceManager {
     /// Creates and starts a new workspace container.
     ///
     /// * `image` - the Docker image to run (e.g. [`IMAGE_CODE_SERVER`] or [`IMAGE_UBUNTU`]).
+    /// * `ports` - named container ports to expose (name, container port), e.g.
+    ///   `[("http", 8080)]`. If empty, falls back to a single `("http", 8080)`
+    ///   binding for backward compatibility with raw-image callers.
     /// * `repo_clone_url` - if provided, the repo is cloned into `/home/coder/project`
     ///   before the container's default process starts.
     /// * `cpu_limit` - fractional CPU limit (e.g. `2.0` for two cores).
@@ -89,6 +117,7 @@ impl WorkspaceManager {
         &self,
         name: &str,
         image: &str,
+        ports: &[(&str, u16)],
         repo_clone_url: Option<&str>,
         cpu_limit: Option<f64>,
         mem_limit_mb: Option<i64>,
@@ -101,19 +130,33 @@ impl WorkspaceManager {
             ));
         }
 
-        let host_port = Self::random_host_port();
+        let ports: Vec<(String, u16)> = if ports.is_empty() {
+            vec![(DEFAULT_PORT_NAME.to_string(), DEFAULT_CONTAINER_PORT)]
+        } else {
+            ports.iter().map(|(n, p)| (n.to_string(), *p)).collect()
+        };
 
         let mut port_bindings = HashMap::new();
-        port_bindings.insert(
-            CODE_SERVER_PORT.to_string(),
-            Some(vec![PortBinding {
-                host_ip: Some("0.0.0.0".to_string()),
-                host_port: Some(host_port.to_string()),
-            }]),
-        );
-
         let mut exposed_ports = HashMap::new();
-        exposed_ports.insert(CODE_SERVER_PORT.to_string(), HashMap::new());
+        let mut host_ports = HashMap::new();
+        let mut labels = HashMap::new();
+        labels.insert(LABEL_WORKSPACE.to_string(), "true".to_string());
+        labels.insert(LABEL_OWNER.to_string(), owner.to_string());
+
+        for (port_name, container_port) in &ports {
+            let host_port = Self::random_host_port();
+            let key = format!("{container_port}/tcp");
+            port_bindings.insert(
+                key.clone(),
+                Some(vec![PortBinding {
+                    host_ip: Some("0.0.0.0".to_string()),
+                    host_port: Some(host_port.to_string()),
+                }]),
+            );
+            exposed_ports.insert(key, HashMap::new());
+            labels.insert(format!("{LABEL_PORT_PREFIX}{port_name}"), container_port.to_string());
+            host_ports.insert(port_name.clone(), host_port);
+        }
 
         let host_config = HostConfig {
             nano_cpus: cpu_limit.map(|c| (c * 1_000_000_000.0) as i64),
@@ -152,10 +195,6 @@ impl WorkspaceManager {
         } else {
             Some(vec!["sleep".to_string(), "infinity".to_string()])
         };
-
-        let mut labels = HashMap::new();
-        labels.insert(LABEL_WORKSPACE.to_string(), "true".to_string());
-        labels.insert(LABEL_OWNER.to_string(), owner.to_string());
 
         let config = Config {
             image: Some(image.to_string()),
@@ -200,7 +239,7 @@ impl WorkspaceManager {
 
         Ok(WorkspaceHandle {
             container_id: created.id,
-            host_port,
+            ports: host_ports,
             name: name.to_string(),
         })
     }
@@ -293,20 +332,46 @@ impl WorkspaceManager {
                 .map(|n| n.trim_start_matches('/').to_string())
                 .unwrap_or_default();
 
-            let host_port = c
-                .ports
+            let container_ports = c.ports.unwrap_or_default();
+            let find_host_port = |container_port: u16| {
+                container_ports
+                    .iter()
+                    .find(|p| p.private_port == container_port)
+                    .and_then(|p| p.public_port)
+            };
+
+            let mut ports = HashMap::new();
+            let port_labels: Vec<(String, u16)> = c
+                .labels
                 .as_ref()
-                .and_then(|ports| {
-                    ports
+                .map(|labels| {
+                    labels
                         .iter()
-                        .find(|p| p.private_port == 8080)
-                        .and_then(|p| p.public_port)
+                        .filter_map(|(k, v)| {
+                            k.strip_prefix(LABEL_PORT_PREFIX)
+                                .and_then(|port_name| v.parse::<u16>().ok().map(|p| (port_name.to_string(), p)))
+                        })
+                        .collect()
                 })
-                .unwrap_or(0);
+                .unwrap_or_default();
+
+            if port_labels.is_empty() {
+                // Container predates named-port labels (or has none): fall back to the
+                // legacy single default-port lookup.
+                if let Some(host_port) = find_host_port(DEFAULT_CONTAINER_PORT) {
+                    ports.insert(DEFAULT_PORT_NAME.to_string(), host_port);
+                }
+            } else {
+                for (port_name, container_port) in port_labels {
+                    if let Some(host_port) = find_host_port(container_port) {
+                        ports.insert(port_name, host_port);
+                    }
+                }
+            }
 
             handles.push(WorkspaceHandle {
                 container_id,
-                host_port,
+                ports,
                 name,
             });
         }

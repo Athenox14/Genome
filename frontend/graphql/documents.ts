@@ -411,29 +411,6 @@ export const ADD_CARD_TO_COLUMN_MUTATION = /* GraphQL */ `
   }
 `
 
-// ---- Two-factor authentication ----
-
-export const ENABLE_TWO_FACTOR_MUTATION = /* GraphQL */ `
-  mutation EnableTwoFactor {
-    enableTwoFactor {
-      secret
-      provisioningUri
-    }
-  }
-`
-
-export const CONFIRM_TWO_FACTOR_MUTATION = /* GraphQL */ `
-  mutation ConfirmTwoFactor($code: String!) {
-    confirmTwoFactor(code: $code)
-  }
-`
-
-export const DISABLE_TWO_FACTOR_MUTATION = /* GraphQL */ `
-  mutation DisableTwoFactor {
-    disableTwoFactor
-  }
-`
-
 // ---- Admin ----
 
 export const ADMIN_LIST_USERS_QUERY = /* GraphQL */ `

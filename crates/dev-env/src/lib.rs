@@ -1,7 +1,9 @@
 pub mod manager;
 pub mod proxy;
+pub mod templates;
 
 pub use manager::{WorkspaceHandle, WorkspaceManager, WorkspaceStatus};
+pub use templates::{find_template, WorkspaceTemplate, TEMPLATES};
 
 use thiserror::Error;
 
