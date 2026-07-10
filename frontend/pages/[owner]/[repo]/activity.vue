@@ -39,21 +39,21 @@ onMounted(load)
 
 <template>
   <div>
-    <h1 class="mb-4 text-xl font-semibold text-gray-900 dark:text-white">
+    <h1 class="mb-4 text-xl font-semibold text-fg">
       Activity · {{ owner }}/{{ repoName }}
     </h1>
 
-    <p v-if="error" class="mb-4 text-sm text-red-600">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-gray-500">Loading…</p>
+    <p v-if="error" class="gh-card mb-4 border-danger bg-red-50 p-3 text-sm text-danger">{{ error }}</p>
+    <p v-if="loading" class="text-sm text-fg-muted">Loading…</p>
 
-    <ul v-else class="divide-y divide-gray-200 rounded border border-gray-200 bg-white dark:bg-gray-900 dark:border-gray-800">
-      <li v-if="events.length === 0" class="p-4 text-sm text-gray-500">No activity yet.</li>
+    <ul v-else class="gh-card divide-y divide-border">
+      <li v-if="events.length === 0" class="p-4 text-sm text-fg-muted">No activity yet.</li>
       <li v-for="event in events" :key="event.id" class="p-4">
         <div class="flex items-center justify-between">
-          <span class="text-sm text-gray-900 dark:text-white">{{ event.summary }}</span>
-          <span class="text-xs text-gray-400">{{ new Date(event.createdAt).toLocaleString() }}</span>
+          <span class="text-sm text-fg">{{ event.summary }}</span>
+          <span class="text-xs text-fg-muted">{{ new Date(event.createdAt).toLocaleString() }}</span>
         </div>
-        <span class="text-xs uppercase tracking-wide text-gray-400">{{ event.kind }}</span>
+        <span class="text-xs uppercase tracking-wide text-fg-muted">{{ event.kind }}</span>
       </li>
     </ul>
   </div>

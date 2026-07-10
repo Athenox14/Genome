@@ -27,7 +27,7 @@ async function loadPulls() {
   error.value = null
   try {
     const result = await $urql
-      .query(PULL_REQUESTS_QUERY, { owner: owner.value, repo: repoName.value })
+      .query(PULL_REQUESTS_QUERY, { owner: owner.value, repo: repoName.value }, { requestPolicy: 'network-only' })
       .toPromise()
     if (result.error) throw result.error
     pulls.value = result.data?.repository?.pullRequests ?? []
@@ -43,25 +43,31 @@ onMounted(loadPulls)
 
 <template>
   <div>
-    <h1 class="mb-4 text-xl font-semibold text-gray-900 dark:text-white">
-      Pull requests · {{ owner }}/{{ repoName }}
-    </h1>
+    <div class="mb-4 flex items-center justify-between">
+      <h1 class="text-xl font-semibold text-fg">
+        Pull requests · {{ owner }}/{{ repoName }}
+      </h1>
+    </div>
 
-    <p v-if="error" class="mb-4 text-sm text-red-600">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-gray-500">Loading…</p>
+    <p v-if="error" class="mb-4 text-sm text-danger-emphasis">{{ error }}</p>
+    <p v-if="loading" class="text-sm text-fg-muted">Loading…</p>
 
-    <ul v-else class="divide-y divide-gray-200 rounded border border-gray-200 bg-white dark:bg-gray-900 dark:border-gray-800">
-      <li v-if="pulls.length === 0" class="p-4 text-sm text-gray-500">No pull requests yet.</li>
+    <ul v-else class="gh-card divide-y divide-border">
+      <li v-if="pulls.length === 0" class="p-4 text-sm text-fg-muted">No pull requests yet.</li>
       <li v-for="pr in pulls" :key="pr.id" class="p-4">
-        <span
-          class="mr-2 rounded px-1.5 py-0.5 text-xs font-medium"
-          :class="pr.state === 'open' ? 'bg-green-100 text-green-700' : 'bg-purple-100 text-purple-700'"
-        >
-          {{ pr.state }}
-        </span>
-        <span class="font-medium text-gray-900 dark:text-white">#{{ pr.number }} {{ pr.title }}</span>
-        <p class="text-xs text-gray-500">
-          {{ pr.sourceBranch }} → {{ pr.targetBranch }}
+        <div class="flex items-center gap-2">
+          <svg
+            class="h-3 w-3 shrink-0"
+            :class="pr.state === 'open' ? 'text-success' : pr.state === 'merged' ? 'text-done' : 'text-danger'"
+            viewBox="0 0 16 16"
+            fill="currentColor"
+          >
+            <circle cx="8" cy="8" r="8" />
+          </svg>
+          <span class="font-medium text-accent hover:underline">#{{ pr.number }} {{ pr.title }}</span>
+        </div>
+        <p class="mt-1 pl-5 text-xs text-fg-muted">
+          {{ pr.sourceBranch }} → {{ pr.targetBranch }} · opened {{ new Date(pr.createdAt).toLocaleDateString() }}
         </p>
       </li>
     </ul>

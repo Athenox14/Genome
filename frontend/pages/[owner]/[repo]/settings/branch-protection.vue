@@ -33,8 +33,8 @@ async function load() {
   error.value = null
   try {
     const [repoResult, rulesResult] = await Promise.all([
-      $urql.query(REPO_OVERVIEW_QUERY, { owner: owner.value, repo: repoName.value }).toPromise(),
-      $urql.query(REPO_BRANCH_PROTECTION_RULES_QUERY, { owner: owner.value, repo: repoName.value }).toPromise()
+      $urql.query(REPO_OVERVIEW_QUERY, { owner: owner.value, repo: repoName.value }, { requestPolicy: 'network-only' }).toPromise(),
+      $urql.query(REPO_BRANCH_PROTECTION_RULES_QUERY, { owner: owner.value, repo: repoName.value }, { requestPolicy: 'network-only' }).toPromise()
     ])
     if (rulesResult.error) throw rulesResult.error
     repoId.value = repoResult.data?.repository?.id ?? null
@@ -76,51 +76,51 @@ onMounted(load)
 
 <template>
   <div class="mx-auto max-w-xl">
-    <h1 class="mb-4 text-xl font-semibold text-gray-900 dark:text-white">
+    <h1 class="mb-4 text-xl font-semibold text-fg">
       Branch protection · {{ owner }}/{{ repoName }}
     </h1>
 
-    <p v-if="error" class="mb-4 text-sm text-red-600">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-gray-500">Loading…</p>
+    <p v-if="error" class="mb-4 text-sm text-danger-emphasis">{{ error }}</p>
+    <p v-if="loading" class="text-sm text-fg-muted">Loading…</p>
 
     <template v-else>
-      <ul class="mb-6 divide-y divide-gray-200 rounded border border-gray-200 bg-white dark:bg-gray-900 dark:border-gray-800">
-        <li v-if="rules.length === 0" class="p-4 text-sm text-gray-500">No rules configured.</li>
+      <ul class="gh-card mb-6 divide-y divide-border">
+        <li v-if="rules.length === 0" class="p-4 text-sm text-fg-muted">No rules configured.</li>
         <li v-for="rule in rules" :key="rule.id" class="p-4 text-sm">
-          <span class="font-medium text-gray-900 dark:text-white">{{ rule.branchPattern }}</span>
-          <span class="ml-2 text-gray-500">
+          <span class="font-medium text-fg">{{ rule.branchPattern }}</span>
+          <span class="ml-2 text-fg-muted">
             requires {{ rule.requireReviewsCount }} review(s)
             <template v-if="rule.blockForcePush">· force-push blocked</template>
           </span>
         </li>
       </ul>
 
-      <form class="space-y-3 rounded border border-gray-200 bg-white p-4 dark:bg-gray-900 dark:border-gray-800" @submit.prevent="createRule">
+      <form class="gh-card space-y-3 p-4" @submit.prevent="createRule">
         <div>
-          <label class="mb-1 block text-xs text-gray-500">Branch pattern</label>
+          <label class="mb-1 block text-xs text-fg-muted">Branch pattern</label>
           <input
             v-model="branchPattern"
             placeholder="main or release/*"
-            class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+            class="w-full rounded border border-border px-3 py-2 text-sm text-fg"
           />
         </div>
         <div>
-          <label class="mb-1 block text-xs text-gray-500">Required approving reviews</label>
+          <label class="mb-1 block text-xs text-fg-muted">Required approving reviews</label>
           <input
             v-model.number="requireReviewsCount"
             type="number"
             min="0"
-            class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+            class="w-full rounded border border-border px-3 py-2 text-sm text-fg"
           />
         </div>
-        <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+        <label class="flex items-center gap-2 text-sm text-fg-muted">
           <input v-model="blockForcePush" type="checkbox" />
           Block force pushes
         </label>
         <button
           type="submit"
           :disabled="submitting"
-          class="rounded bg-gray-900 px-3 py-1.5 text-sm text-white hover:bg-gray-700 disabled:opacity-50"
+          class="gh-btn-primary disabled:opacity-50"
         >
           {{ submitting ? 'Creating…' : 'Create rule' }}
         </button>

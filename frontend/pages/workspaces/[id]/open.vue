@@ -46,19 +46,19 @@ onMounted(loadWorkspace)
 <template>
   <div class="flex h-[calc(100vh-8rem)] flex-col">
     <div class="mb-2 flex items-center justify-between">
-      <NuxtLink to="/workspaces" class="text-sm text-blue-600 hover:underline">← Back to workspaces</NuxtLink>
-      <h1 v-if="workspace" class="text-sm font-medium text-gray-700 dark:text-gray-300">
+      <NuxtLink to="/workspaces" class="text-sm text-accent hover:underline">← Back to workspaces</NuxtLink>
+      <h1 v-if="workspace" class="text-sm font-medium text-fg-muted">
         {{ workspace.name }}
       </h1>
     </div>
 
-    <p v-if="error" class="text-sm text-red-600">{{ error }}</p>
-    <p v-else-if="loading" class="text-sm text-gray-500">Loading…</p>
+    <p v-if="error" class="text-sm text-danger-emphasis">{{ error }}</p>
+    <p v-else-if="loading" class="text-sm text-fg-muted">Loading…</p>
 
     <iframe
       v-else-if="iframeSrc"
       :src="iframeSrc"
-      class="flex-1 rounded border border-gray-200 dark:border-gray-800"
+      class="flex-1 rounded border border-border"
       title="Dev workspace (code-server)"
     />
   </div>

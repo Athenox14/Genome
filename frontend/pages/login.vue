@@ -17,34 +17,34 @@ async function onSubmit() {
 </script>
 
 <template>
-  <div class="mx-auto mt-16 max-w-sm rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:bg-gray-900 dark:border-gray-800">
-    <h1 class="mb-4 text-xl font-semibold text-gray-900 dark:text-white">Log in to Genome</h1>
+  <div class="gh-card mx-auto mt-16 max-w-sm p-6">
+    <h1 class="mb-4 text-xl font-semibold text-fg">Log in to Genome</h1>
 
     <form class="space-y-4" @submit.prevent="onSubmit">
       <div>
-        <label class="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-300">Username</label>
+        <label class="mb-1 block text-sm font-medium text-fg-muted">Username</label>
         <input
           v-model="username"
           type="text"
           required
           :disabled="auth.totpRequired"
-          class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white disabled:opacity-50"
+          class="w-full rounded border border-border px-3 py-2 text-sm text-fg disabled:opacity-50"
         />
       </div>
 
       <div>
-        <label class="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-300">Password</label>
+        <label class="mb-1 block text-sm font-medium text-fg-muted">Password</label>
         <input
           v-model="password"
           type="password"
           required
           :disabled="auth.totpRequired"
-          class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white disabled:opacity-50"
+          class="w-full rounded border border-border px-3 py-2 text-sm text-fg disabled:opacity-50"
         />
       </div>
 
       <div v-if="auth.totpRequired">
-        <label class="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-300">
+        <label class="mb-1 block text-sm font-medium text-fg-muted">
           Two-factor authentication code
         </label>
         <input
@@ -54,16 +54,16 @@ async function onSubmit() {
           autocomplete="one-time-code"
           placeholder="123456"
           required
-          class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+          class="w-full rounded border border-border px-3 py-2 text-sm text-fg"
         />
       </div>
 
-      <p v-if="auth.error" class="text-sm text-red-600">{{ auth.error }}</p>
+      <p v-if="auth.error" class="text-sm text-danger-emphasis">{{ auth.error }}</p>
 
       <button
         type="submit"
         :disabled="auth.loading"
-        class="w-full rounded bg-gray-900 px-3 py-2 text-sm font-medium text-white hover:bg-gray-700 disabled:opacity-50"
+        class="gh-btn-primary w-full disabled:opacity-50"
       >
         {{ auth.loading ? 'Logging in…' : (auth.totpRequired ? 'Verify code' : 'Log in') }}
       </button>

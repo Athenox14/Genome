@@ -65,36 +65,36 @@ async function disable() {
 
 <template>
   <div class="mx-auto max-w-xl">
-    <h1 class="mb-4 text-xl font-semibold text-gray-900 dark:text-white">Security</h1>
+    <h1 class="mb-4 text-xl font-semibold text-fg">Security</h1>
 
-    <div class="rounded border border-gray-200 bg-white p-4 dark:bg-gray-900 dark:border-gray-800">
-      <h2 class="mb-2 font-medium text-gray-900 dark:text-white">Two-factor authentication</h2>
+    <div class="gh-card p-4">
+      <h2 class="mb-2 font-medium text-fg">Two-factor authentication</h2>
 
-      <p v-if="error" class="mb-3 text-sm text-red-600">{{ error }}</p>
+      <p v-if="error" class="mb-3 text-sm text-danger-emphasis">{{ error }}</p>
 
-      <div v-if="confirmed" class="text-sm text-green-700 dark:text-green-400">
+      <div v-if="confirmed" class="text-sm text-success-emphasis">
         Two-factor authentication is now enabled.
       </div>
 
       <template v-else-if="provisioningUri">
-        <p class="mb-2 text-sm text-gray-600 dark:text-gray-300">
+        <p class="mb-2 text-sm text-fg-muted">
           Scan this URI with your authenticator app, or enter the secret manually, then confirm with a code.
         </p>
-        <p class="mb-2 break-all rounded bg-gray-100 p-2 font-mono text-xs dark:bg-gray-800 dark:text-gray-200">
+        <p class="mb-2 break-all rounded bg-canvas-subtle p-2 font-mono text-xs text-fg">
           {{ provisioningUri }}
         </p>
-        <p class="mb-4 text-sm text-gray-600 dark:text-gray-300">
+        <p class="mb-4 text-sm text-fg-muted">
           Manual entry secret: <span class="font-mono">{{ secret }}</span>
         </p>
         <div class="flex gap-2">
           <input
             v-model="code"
             placeholder="6-digit code"
-            class="rounded border border-gray-300 px-3 py-1.5 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+            class="rounded border border-border px-3 py-1.5 text-sm text-fg"
           />
           <button
             :disabled="loading"
-            class="rounded bg-gray-900 px-3 py-1.5 text-sm text-white hover:bg-gray-700 disabled:opacity-50"
+            class="gh-btn-primary disabled:opacity-50"
             @click="confirm"
           >
             Confirm
@@ -105,17 +105,17 @@ async function disable() {
       <template v-else>
         <button
           :disabled="loading"
-          class="rounded bg-gray-900 px-3 py-1.5 text-sm text-white hover:bg-gray-700 disabled:opacity-50"
+          class="gh-btn-primary disabled:opacity-50"
           @click="enable"
         >
           Enable 2FA
         </button>
       </template>
 
-      <div class="mt-6 border-t border-gray-200 pt-4 dark:border-gray-800">
+      <div class="mt-6 border-t border-border pt-4">
         <button
           :disabled="loading"
-          class="rounded bg-red-50 px-3 py-1.5 text-sm text-red-700 hover:bg-red-100 disabled:opacity-50 dark:bg-red-900/30 dark:text-red-300"
+          class="rounded border border-danger px-3 py-1.5 text-sm text-danger-emphasis hover:bg-danger/10 disabled:opacity-50"
           @click="disable"
         >
           Disable 2FA

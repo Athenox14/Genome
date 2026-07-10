@@ -16,7 +16,11 @@ async function loadPages() {
   error.value = null
   try {
     const result = await $urql
-      .query(WIKI_PAGES_QUERY, { owner: owner.value, repo: repoName.value })
+      .query(
+        WIKI_PAGES_QUERY,
+        { owner: owner.value, repo: repoName.value },
+        { requestPolicy: 'network-only' }
+      )
       .toPromise()
     if (result.error) throw result.error
     pages.value = result.data?.repository?.wikiPages ?? []
@@ -33,26 +37,26 @@ onMounted(loadPages)
 <template>
   <div>
     <div class="mb-4 flex items-center justify-between">
-      <h1 class="text-xl font-semibold text-gray-900 dark:text-white">
+      <h1 class="text-xl font-semibold text-fg">
         Wiki · {{ owner }}/{{ repoName }}
       </h1>
       <NuxtLink
         :to="`/${owner}/${repoName}/wiki/new`"
-        class="rounded bg-gray-900 px-3 py-1.5 text-sm text-white hover:bg-gray-700"
+        class="gh-btn-primary"
       >
         New page
       </NuxtLink>
     </div>
 
-    <p v-if="error" class="mb-4 text-sm text-red-600">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-gray-500">Loading…</p>
+    <p v-if="error" class="gh-card mb-4 border-danger bg-red-50 p-3 text-sm text-danger">{{ error }}</p>
+    <p v-if="loading" class="text-sm text-fg-muted">Loading…</p>
 
-    <ul v-else class="divide-y divide-gray-200 rounded border border-gray-200 bg-white dark:bg-gray-900 dark:border-gray-800">
-      <li v-if="pages.length === 0" class="p-4 text-sm text-gray-500">No wiki pages yet.</li>
-      <li v-for="page in pages" :key="page" class="p-4">
+    <ul v-else class="gh-card divide-y divide-border">
+      <li v-if="pages.length === 0" class="p-4 text-sm text-fg-muted">No wiki pages yet.</li>
+      <li v-for="page in pages" :key="page" class="p-4 hover:bg-canvas-subtle">
         <NuxtLink
           :to="`/${owner}/${repoName}/wiki/${encodeURIComponent(page)}`"
-          class="font-medium text-blue-600 hover:underline dark:text-blue-400"
+          class="font-medium text-accent hover:underline"
         >
           {{ page }}
         </NuxtLink>

@@ -39,49 +39,49 @@ onMounted(() => {
 
 <template>
   <div>
-    <h1 class="mb-4 text-xl font-semibold text-gray-900 dark:text-white">Search</h1>
+    <h1 class="mb-4 text-xl font-semibold text-fg">Search</h1>
 
     <form class="mb-6 flex gap-2" @submit.prevent="runSearch">
       <input
         v-model="queryText"
         placeholder="Search repositories, issues, users…"
-        class="flex-1 rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+        class="flex-1 rounded border border-border px-3 py-2 text-sm text-fg"
       />
-      <button class="rounded bg-gray-900 px-3 py-2 text-sm text-white hover:bg-gray-700">Search</button>
+      <button class="gh-btn-primary">Search</button>
     </form>
 
-    <p v-if="error" class="mb-4 text-sm text-red-600">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-gray-500">Searching…</p>
+    <p v-if="error" class="mb-4 text-sm text-danger-emphasis">{{ error }}</p>
+    <p v-if="loading" class="text-sm text-fg-muted">Searching…</p>
 
     <template v-else-if="searched">
       <div class="mb-6">
-        <h2 class="mb-2 text-sm font-semibold text-gray-500">Repositories</h2>
-        <ul class="divide-y divide-gray-200 rounded border border-gray-200 bg-white dark:bg-gray-900 dark:border-gray-800">
-          <li v-if="repositories.length === 0" class="p-3 text-sm text-gray-500">No matches.</li>
+        <h2 class="mb-2 text-sm font-semibold text-fg-muted">Repositories</h2>
+        <ul class="gh-card divide-y divide-border">
+          <li v-if="repositories.length === 0" class="p-3 text-sm text-fg-muted">No matches.</li>
           <li v-for="repo in repositories" :key="repo.id" class="p-3">
-            <NuxtLink :to="`/${repo.ownerLogin}/${repo.name}`" class="font-medium text-blue-600 hover:underline dark:text-blue-400">
+            <NuxtLink :to="`/${repo.ownerLogin}/${repo.name}`" class="font-medium text-accent hover:underline">
               {{ repo.ownerLogin }}/{{ repo.name }}
             </NuxtLink>
-            <p v-if="repo.description" class="text-xs text-gray-500">{{ repo.description }}</p>
+            <p v-if="repo.description" class="text-xs text-fg-muted">{{ repo.description }}</p>
           </li>
         </ul>
       </div>
 
       <div class="mb-6">
-        <h2 class="mb-2 text-sm font-semibold text-gray-500">Issues</h2>
-        <ul class="divide-y divide-gray-200 rounded border border-gray-200 bg-white dark:bg-gray-900 dark:border-gray-800">
-          <li v-if="issues.length === 0" class="p-3 text-sm text-gray-500">No matches.</li>
-          <li v-for="issue in issues" :key="issue.id" class="p-3 text-sm text-gray-900 dark:text-white">
+        <h2 class="mb-2 text-sm font-semibold text-fg-muted">Issues</h2>
+        <ul class="gh-card divide-y divide-border">
+          <li v-if="issues.length === 0" class="p-3 text-sm text-fg-muted">No matches.</li>
+          <li v-for="issue in issues" :key="issue.id" class="p-3 text-sm text-fg">
             #{{ issue.number }} {{ issue.title }}
           </li>
         </ul>
       </div>
 
       <div>
-        <h2 class="mb-2 text-sm font-semibold text-gray-500">Users</h2>
-        <ul class="divide-y divide-gray-200 rounded border border-gray-200 bg-white dark:bg-gray-900 dark:border-gray-800">
-          <li v-if="users.length === 0" class="p-3 text-sm text-gray-500">No matches.</li>
-          <li v-for="user in users" :key="user.id" class="p-3 text-sm text-gray-900 dark:text-white">
+        <h2 class="mb-2 text-sm font-semibold text-fg-muted">Users</h2>
+        <ul class="gh-card divide-y divide-border">
+          <li v-if="users.length === 0" class="p-3 text-sm text-fg-muted">No matches.</li>
+          <li v-for="user in users" :key="user.id" class="p-3 text-sm text-fg">
             {{ user.username }}
           </li>
         </ul>

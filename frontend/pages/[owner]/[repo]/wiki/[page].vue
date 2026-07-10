@@ -150,19 +150,19 @@ onMounted(loadPage)
 <template>
   <div>
     <div class="mb-4 flex items-center justify-between">
-      <h1 class="text-xl font-semibold text-gray-900 dark:text-white">
+      <h1 class="text-xl font-semibold text-fg">
         Wiki · {{ isNew ? 'New page' : pageName }}
       </h1>
       <div class="flex gap-2">
         <NuxtLink
           :to="`/${owner}/${repoName}/wiki`"
-          class="rounded bg-gray-100 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200"
+          class="gh-btn-secondary"
         >
           Back to wiki
         </NuxtLink>
         <button
           v-if="!isNew && !editing"
-          class="rounded bg-gray-900 px-3 py-1.5 text-sm text-white hover:bg-gray-700"
+          class="gh-btn-primary"
           @click="editing = true"
         >
           Edit
@@ -170,11 +170,11 @@ onMounted(loadPage)
       </div>
     </div>
 
-    <p v-if="error" class="mb-4 text-sm text-red-600">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-gray-500">Loading…</p>
+    <p v-if="error" class="gh-card mb-4 border-danger bg-red-50 p-3 text-sm text-danger">{{ error }}</p>
+    <p v-if="loading" class="text-sm text-fg-muted">Loading…</p>
 
     <template v-else>
-      <p v-if="notFound && !isNew" class="mb-4 text-sm text-gray-500">
+      <p v-if="notFound && !isNew" class="mb-4 text-sm text-fg-muted">
         This page doesn't exist yet. Write it below to create it.
       </p>
 
@@ -183,30 +183,30 @@ onMounted(loadPage)
           v-if="isNew"
           v-model="newPageName"
           placeholder="Page name (e.g. Home)"
-          class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+          class="w-full rounded-md border border-border px-3 py-2 text-sm text-fg"
         />
         <textarea
           v-model="content"
           rows="16"
           placeholder="Markdown content"
-          class="w-full rounded border border-gray-300 px-3 py-2 font-mono text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+          class="w-full rounded-md border border-border px-3 py-2 font-mono text-sm text-fg"
         />
         <input
           v-model="message"
           placeholder="Commit message (optional)"
-          class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+          class="w-full rounded-md border border-border px-3 py-2 text-sm text-fg"
         />
         <div class="flex gap-2">
           <button
             :disabled="saving"
-            class="rounded bg-gray-900 px-3 py-1.5 text-sm text-white hover:bg-gray-700 disabled:opacity-50"
+            class="gh-btn-primary disabled:opacity-50"
             @click="save"
           >
             {{ saving ? 'Saving…' : 'Save' }}
           </button>
           <button
             v-if="!isNew && !notFound"
-            class="rounded bg-gray-100 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200"
+            class="gh-btn-secondary"
             @click="editing = false"
           >
             Cancel
@@ -216,7 +216,7 @@ onMounted(loadPage)
 
       <div
         v-else
-        class="prose prose-sm max-w-none rounded border border-gray-200 bg-white p-4 dark:bg-gray-900 dark:border-gray-800 dark:prose-invert"
+        class="gh-card prose prose-sm max-w-none p-4 text-fg"
         v-html="renderedHtml"
       />
     </template>

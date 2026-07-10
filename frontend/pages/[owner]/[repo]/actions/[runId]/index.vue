@@ -55,24 +55,24 @@ onBeforeUnmount(() => {
 
 <template>
   <div>
-    <NuxtLink :to="`/${owner}/${repoName}/actions`" class="mb-4 inline-block text-sm text-blue-600 hover:underline">
+    <NuxtLink :to="`/${owner}/${repoName}/actions`" class="mb-4 inline-block text-sm text-accent hover:underline">
       ← Back to runs
     </NuxtLink>
 
-    <p v-if="error" class="mb-4 text-sm text-red-600">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-gray-500">Loading…</p>
+    <p v-if="error" class="mb-4 text-sm text-danger-emphasis">{{ error }}</p>
+    <p v-if="loading" class="text-sm text-fg-muted">Loading…</p>
 
     <template v-else-if="run">
-      <h1 class="mb-4 text-xl font-semibold text-gray-900 dark:text-white">
+      <h1 class="mb-4 text-xl font-semibold text-fg">
         {{ run.workflowName }}
-        <span class="ml-2 text-sm font-normal text-gray-500">({{ run.status }})</span>
+        <span class="ml-2 text-sm font-normal text-fg-muted">({{ run.status }})</span>
       </h1>
 
-      <div class="rounded border border-gray-200 bg-white p-4 text-sm dark:bg-gray-900 dark:border-gray-800">
-        <p><span class="font-medium text-gray-700 dark:text-gray-300">Event:</span> {{ run.event }}</p>
-        <p><span class="font-medium text-gray-700 dark:text-gray-300">Commit:</span> {{ run.commitSha }}</p>
-        <p v-if="run.startedAt"><span class="font-medium text-gray-700 dark:text-gray-300">Started:</span> {{ run.startedAt }}</p>
-        <p v-if="run.finishedAt"><span class="font-medium text-gray-700 dark:text-gray-300">Finished:</span> {{ run.finishedAt }}</p>
+      <div class="gh-card p-4 text-sm">
+        <p><span class="font-medium text-fg-muted">Event:</span> {{ run.event }}</p>
+        <p><span class="font-medium text-fg-muted">Commit:</span> {{ run.commitSha }}</p>
+        <p v-if="run.startedAt"><span class="font-medium text-fg-muted">Started:</span> {{ run.startedAt }}</p>
+        <p v-if="run.finishedAt"><span class="font-medium text-fg-muted">Finished:</span> {{ run.finishedAt }}</p>
       </div>
     </template>
   </div>

@@ -56,19 +56,19 @@ onBeforeUnmount(() => {
 
 <template>
   <div>
-    <h1 class="mb-4 text-xl font-semibold text-gray-900 dark:text-white">
+    <h1 class="mb-4 text-xl font-semibold text-fg">
       Actions · {{ owner }}/{{ repoName }}
     </h1>
 
-    <p v-if="error" class="mb-4 text-sm text-red-600">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-gray-500">Loading…</p>
+    <p v-if="error" class="mb-4 text-sm text-danger-emphasis">{{ error }}</p>
+    <p v-if="loading" class="text-sm text-fg-muted">Loading…</p>
 
-    <ul v-else class="divide-y divide-gray-200 rounded border border-gray-200 bg-white dark:bg-gray-900 dark:border-gray-800">
-      <li v-if="runs.length === 0" class="p-4 text-sm text-gray-500">No workflow runs yet.</li>
+    <ul v-else class="gh-card divide-y divide-border">
+      <li v-if="runs.length === 0" class="p-4 text-sm text-fg-muted">No workflow runs yet.</li>
       <li
         v-for="run in runs"
         :key="run.id"
-        class="cursor-pointer p-4 hover:bg-gray-50 dark:hover:bg-gray-800"
+        class="cursor-pointer p-4 hover:bg-canvas-subtle"
       >
         <NuxtLink :to="`/${owner}/${repoName}/actions/${run.id}`" class="flex items-center justify-between">
           <div>
@@ -78,10 +78,10 @@ onBeforeUnmount(() => {
             >
               {{ run.status }}
             </span>
-            <span class="font-medium text-gray-900 dark:text-white">
+            <span class="font-medium text-accent">
               {{ run.workflowName }}
             </span>
-            <p class="text-xs text-gray-500">
+            <p class="text-xs text-fg-muted">
               {{ run.event }} @ {{ run.commitSha.slice(0, 7) }}
             </p>
           </div>

@@ -35,7 +35,7 @@ async function loadRepos() {
   loading.value = true
   error.value = null
   try {
-    const result = await $urql.query(MY_REPOSITORIES_QUERY, {}).toPromise()
+    const result = await $urql.query(MY_REPOSITORIES_QUERY, {}, { requestPolicy: 'network-only' }).toPromise()
     if (result.error) throw result.error
     repos.value = result.data?.myRepositories ?? []
   } catch (err: any) {
@@ -75,9 +75,9 @@ onMounted(loadRepos)
 <template>
   <div>
     <div class="mb-4 flex items-center justify-between">
-      <h1 class="text-xl font-semibold text-gray-900 dark:text-white">Your repositories</h1>
+      <h1 class="text-xl font-semibold text-fg">Your repositories</h1>
       <button
-        class="rounded bg-gray-900 px-3 py-1.5 text-sm text-white hover:bg-gray-700"
+        class="gh-btn-primary"
         @click="showCreateForm = !showCreateForm"
       >
         New repository
@@ -86,47 +86,52 @@ onMounted(loadRepos)
 
     <div
       v-if="showCreateForm"
-      class="mb-6 rounded border border-gray-200 bg-white p-4 dark:bg-gray-900 dark:border-gray-800"
+      class="gh-card mb-6 p-4"
     >
       <form class="space-y-3" @submit.prevent="createRepo">
         <input
           v-model="newRepoName"
           placeholder="Repository name"
           required
-          class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+          class="w-full rounded border border-border px-3 py-2 text-sm text-fg"
         />
         <textarea
           v-model="newRepoDescription"
           placeholder="Description (optional)"
-          class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+          class="w-full rounded border border-border px-3 py-2 text-sm text-fg"
         />
-        <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+        <label class="flex items-center gap-2 text-sm text-fg-muted">
           <input v-model="newRepoPrivate" type="checkbox" />
           Private
         </label>
         <button
           type="submit"
           :disabled="creating"
-          class="rounded bg-gray-900 px-3 py-1.5 text-sm text-white hover:bg-gray-700 disabled:opacity-50"
+          class="gh-btn-primary disabled:opacity-50"
         >
           {{ creating ? 'Creating…' : 'Create' }}
         </button>
       </form>
     </div>
 
-    <p v-if="error" class="mb-4 text-sm text-red-600">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-gray-500">Loading…</p>
+    <p v-if="error" class="mb-4 text-sm text-danger-emphasis">{{ error }}</p>
+    <p v-if="loading" class="text-sm text-fg-muted">Loading…</p>
 
-    <ul v-else class="divide-y divide-gray-200 rounded border border-gray-200 bg-white dark:bg-gray-900 dark:border-gray-800">
-      <li v-if="repos.length === 0" class="p-4 text-sm text-gray-500">No repositories yet.</li>
-      <li v-for="repo in repos" :key="repo.id" class="p-4 hover:bg-gray-50 dark:hover:bg-gray-800">
-        <NuxtLink :to="`/${ownerSlug(repo)}/${repo.name}`" class="font-medium text-blue-600 hover:underline">
-          {{ ownerSlug(repo) }}/{{ repo.name }}
-        </NuxtLink>
-        <span v-if="repo.isPrivate" class="ml-2 rounded bg-gray-200 px-1.5 py-0.5 text-xs text-gray-700 dark:bg-gray-700 dark:text-gray-200">
-          Private
-        </span>
-        <p v-if="repo.description" class="mt-1 text-sm text-gray-600 dark:text-gray-400">{{ repo.description }}</p>
+    <ul v-else class="gh-card divide-y divide-border">
+      <li v-if="repos.length === 0" class="p-4 text-sm text-fg-muted">No repositories yet.</li>
+      <li v-for="repo in repos" :key="repo.id" class="flex items-start gap-3 p-4 hover:bg-canvas-subtle">
+        <svg class="mt-1 h-4 w-4 shrink-0 text-fg-muted" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M2 2.5A2.5 2.5 0 0 1 4.5 0h8.75a.75.75 0 0 1 .75.75v12.5a.75.75 0 0 1-.75.75h-2.5a.75.75 0 0 1 0-1.5h1.75v-2H4.5a1 1 0 0 0-.98 1.19.75.75 0 1 1-1.47.3A2.5 2.5 0 0 1 2 11.5Zm10.5-.5h-8a1 1 0 0 0-1 1v6.708A2.486 2.486 0 0 1 4.5 9h8Z"/>
+        </svg>
+        <div>
+          <NuxtLink :to="`/${ownerSlug(repo)}/${repo.name}`" class="font-medium text-accent hover:underline">
+            {{ ownerSlug(repo) }}/{{ repo.name }}
+          </NuxtLink>
+          <span v-if="repo.isPrivate" class="ml-2 rounded-full border border-border px-1.5 py-0.5 text-xs text-fg-muted">
+            Private
+          </span>
+          <p v-if="repo.description" class="mt-1 text-sm text-fg-muted">{{ repo.description }}</p>
+        </div>
       </li>
     </ul>
   </div>

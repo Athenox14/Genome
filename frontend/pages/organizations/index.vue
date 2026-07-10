@@ -23,7 +23,7 @@ async function loadOrganizations() {
   loading.value = true
   error.value = null
   try {
-    const result = await $urql.query(ORGANIZATIONS_QUERY, {}).toPromise()
+    const result = await $urql.query(ORGANIZATIONS_QUERY, {}, { requestPolicy: 'network-only' }).toPromise()
     if (result.error) throw result.error
     organizations.value = result.data?.organizations ?? []
   } catch (err: any) {
@@ -58,46 +58,46 @@ onMounted(loadOrganizations)
 <template>
   <div>
     <div class="mb-4 flex items-center justify-between">
-      <h1 class="text-xl font-semibold text-gray-900 dark:text-white">Organizations</h1>
+      <h1 class="text-xl font-semibold text-fg">Organizations</h1>
       <button
-        class="rounded bg-gray-900 px-3 py-1.5 text-sm text-white hover:bg-gray-700"
+        class="gh-btn-primary"
         @click="showForm = !showForm"
       >
         New organization
       </button>
     </div>
 
-    <div v-if="showForm" class="mb-6 rounded border border-gray-200 bg-white p-4 dark:bg-gray-900 dark:border-gray-800">
+    <div v-if="showForm" class="gh-card mb-6 p-4">
       <form class="space-y-3" @submit.prevent="createOrganization">
         <input
           v-model="newName"
           placeholder="Organization name"
           required
-          class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+          class="w-full rounded border border-border px-3 py-2 text-sm text-fg"
         />
         <textarea
           v-model="newDescription"
           placeholder="Description (optional)"
-          class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+          class="w-full rounded border border-border px-3 py-2 text-sm text-fg"
         />
         <button
           type="submit"
           :disabled="creating"
-          class="rounded bg-gray-900 px-3 py-1.5 text-sm text-white hover:bg-gray-700 disabled:opacity-50"
+          class="gh-btn-primary disabled:opacity-50"
         >
           {{ creating ? 'Creating…' : 'Create' }}
         </button>
       </form>
     </div>
 
-    <p v-if="error" class="mb-4 text-sm text-red-600">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-gray-500">Loading…</p>
+    <p v-if="error" class="mb-4 text-sm text-danger-emphasis">{{ error }}</p>
+    <p v-if="loading" class="text-sm text-fg-muted">Loading…</p>
 
-    <ul v-else class="divide-y divide-gray-200 rounded border border-gray-200 bg-white dark:bg-gray-900 dark:border-gray-800">
-      <li v-if="organizations.length === 0" class="p-4 text-sm text-gray-500">No organizations yet.</li>
+    <ul v-else class="gh-card divide-y divide-border">
+      <li v-if="organizations.length === 0" class="p-4 text-sm text-fg-muted">No organizations yet.</li>
       <li v-for="org in organizations" :key="org.id" class="p-4">
-        <span class="font-medium text-gray-900 dark:text-white">{{ org.name }}</span>
-        <p v-if="org.description" class="mt-1 text-sm text-gray-600 dark:text-gray-400">{{ org.description }}</p>
+        <span class="font-medium text-accent hover:underline">{{ org.name }}</span>
+        <p v-if="org.description" class="mt-1 text-sm text-fg-muted">{{ org.description }}</p>
       </li>
     </ul>
   </div>
