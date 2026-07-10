@@ -23,8 +23,6 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws", "macros"] }
 async-graphql = { version = "7", features = ["chrono", "uuid"] }
 async-graphql-axum = "7"
-sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "with-chrono", "with-uuid", "with-json"] }
-sea-orm-migration = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
