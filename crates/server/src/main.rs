@@ -1,6 +1,5 @@
 mod config;
 mod error;
-mod rate_limit;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -9,12 +8,12 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
 use migration::MigratorTrait;
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -127,7 +126,17 @@ async fn main() -> anyhow::Result<()> {
         app_ctx: app_ctx.clone(),
         config: config.clone(),
     };
-    let limiter = rate_limit::RateLimiter::new();
+    // Per-IP token-bucket rate limiting via `tower_governor`: replenishes one
+    // request allowance every 500ms (2/sec sustained, matching the previous
+    // fixed-window limiter's ~120 req/min average) with a burst allowance of
+    // 120 requests, keyed by peer IP by default. Excess requests get a 429.
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_millisecond(500)
+            .burst_size(120)
+            .finish()
+            .expect("valid governor rate-limit configuration"),
+    );
 
     tokio::spawn(auto_stop_dev_workspaces(app_ctx.clone()));
     tokio::spawn(sync_repo_mirrors(app_ctx));
@@ -170,10 +179,9 @@ async fn main() -> anyhow::Result<()> {
             "/artifacts/:id/download",
             get(download_artifact_handler),
         )
-        .layer(middleware::from_fn_with_state(
-            limiter,
-            rate_limit::rate_limit_middleware,
-        ))
+        .layer(GovernorLayer {
+            config: governor_conf,
+        })
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state);

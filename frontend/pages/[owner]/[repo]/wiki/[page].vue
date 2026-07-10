@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { WIKI_PAGE_QUERY, WRITE_WIKI_PAGE_MUTATION, REPO_OVERVIEW_QUERY } from '~/graphql/documents'
+import { marked } from 'marked'
 
 const route = useRoute()
 const owner = computed(() => String(route.params.owner))
@@ -19,60 +20,17 @@ const editing = ref(false)
 const error = ref<string | null>(null)
 const notFound = ref(false)
 
-/** Minimal hand-rolled markdown -> HTML converter (headings, bold/italic,
- * links, inline code, fenced code blocks, and paragraphs). Not a full
- * CommonMark implementation, but enough to render wiki pages readably. */
-function renderMarkdown(md: string): string {
-  const escapeHtml = (s: string) =>
-    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-
-  const lines = md.split('\n')
-  const html: string[] = []
-  let inCode = false
-  let paragraph: string[] = []
-
-  const flushParagraph = () => {
-    if (paragraph.length) {
-      let text = escapeHtml(paragraph.join(' '))
-      text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      text = text.replace(/\*(.+?)\*/g, '<em>$1</em>')
-      text = text.replace(/`([^`]+)`/g, '<code>$1</code>')
-      text = text.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2" class="text-blue-600 hover:underline">$1</a>')
-      html.push(`<p>${text}</p>`)
-      paragraph = []
-    }
-  }
-
-  for (const rawLine of lines) {
-    if (rawLine.trim().startsWith('```')) {
-      flushParagraph()
-      if (inCode) html.push('</code></pre>')
-      else html.push('<pre class="rounded bg-gray-100 p-3 text-xs dark:bg-gray-800"><code>')
-      inCode = !inCode
-      continue
-    }
-    if (inCode) {
-      html.push(escapeHtml(rawLine) + '\n')
-      continue
-    }
-    const heading = rawLine.match(/^(#{1,6})\s+(.*)$/)
-    if (heading) {
-      flushParagraph()
-      const level = heading[1].length
-      html.push(`<h${level} class="font-semibold mt-4 mb-2">${escapeHtml(heading[2])}</h${level}>`)
-      continue
-    }
-    if (rawLine.trim() === '') {
-      flushParagraph()
-      continue
-    }
-    paragraph.push(rawLine)
-  }
-  flushParagraph()
-  return html.join('\n')
-}
-
-const renderedHtml = computed(() => renderMarkdown(content.value))
+// Full CommonMark rendering via `marked` (tables, lists, etc. included).
+// NOTE: like the previous hand-rolled renderer's output, this is injected
+// via `v-html` without HTML sanitization. Unlike the old renderer — which
+// HTML-escaped the source text before applying its own limited formatting,
+// so raw HTML in wiki content could never execute — `marked` passes through
+// raw HTML embedded in the markdown source unescaped. Wiki content is
+// treated here as trusted (same trust level as before for repo
+// collaborators), but this is a lateral behavior change worth hardening
+// with an HTML sanitizer (e.g. DOMPurify) if wiki content should ever be
+// treated as untrusted input.
+const renderedHtml = computed(() => marked.parse(content.value, { async: false }) as string)
 
 async function loadRepoId() {
   const result = await $urql

@@ -22,15 +22,7 @@ pub fn generate_access_token() -> (String, String) {
 /// Hex-encoded SHA256 hash of a token, for lookup/comparison against stored hashes.
 pub fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
-    hex_encode(&digest)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    hex::encode(digest)
 }
 
 #[cfg(test)]

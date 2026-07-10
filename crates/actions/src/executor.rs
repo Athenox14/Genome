@@ -161,7 +161,6 @@ impl Executor {
                 .await;
         };
 
-        // Upload the repo archive into /workspace.
         if let Err(e) = self
             .docker
             .upload_to_container(
@@ -193,7 +192,6 @@ impl Executor {
             }
 
             let Some(run) = &step.run else {
-                // Neither `run` nor `uses` set: nothing to do.
                 continue;
             };
 

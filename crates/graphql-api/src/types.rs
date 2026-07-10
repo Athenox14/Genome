@@ -138,7 +138,6 @@ impl RepositoryObject {
         Ok(runs.into_iter().map(WorkflowRunObject::from).collect())
     }
 
-    /// Packages published against this repository.
     async fn packages(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<PackageObject>> {
         let app = ctx.data::<AppContext>()?;
         let packages = entity::prelude::Package::find()
@@ -183,7 +182,6 @@ impl RepositoryObject {
         Ok(entries.into_iter().map(TreeEntryObject::from).collect())
     }
 
-    /// Names of the Markdown pages present in this repository's wiki.
     async fn wiki_pages(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<String>> {
         let app = ctx.data::<AppContext>()?;
         let pages = app
@@ -216,7 +214,6 @@ impl RepositoryObject {
         Ok(commits.into_iter().map(CommitObject::from).collect())
     }
 
-    /// Branch protection rules configured for this repository.
     async fn branch_protection_rules(
         &self,
         ctx: &Context<'_>,
@@ -245,7 +242,6 @@ impl RepositoryObject {
         Ok(events.into_iter().map(ActivityEventObject::from).collect())
     }
 
-    /// Labels defined for this repository.
     async fn labels(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<LabelObject>> {
         let app = ctx.data::<AppContext>()?;
         let labels = entity::prelude::Label::find()
@@ -255,7 +251,6 @@ impl RepositoryObject {
         Ok(labels.into_iter().map(LabelObject::from).collect())
     }
 
-    /// Milestones defined for this repository.
     async fn milestones(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<MilestoneObject>> {
         let app = ctx.data::<AppContext>()?;
         let milestones = entity::prelude::Milestone::find()
@@ -275,7 +270,6 @@ impl RepositoryObject {
         Ok(projects.into_iter().map(ProjectObject::from).collect())
     }
 
-    /// Webhooks configured to receive events for this repository.
     async fn webhooks(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<WebhookObject>> {
         let app = ctx.data::<AppContext>()?;
         let hooks = entity::prelude::Webhook::find()
@@ -340,7 +334,6 @@ impl From<entity::issue::Model> for IssueObject {
 
 #[ComplexObject]
 impl IssueObject {
-    /// Labels attached to this issue.
     async fn labels(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<LabelObject>> {
         let app = ctx.data::<AppContext>()?;
         let links = entity::prelude::IssueLabel::find()
@@ -358,7 +351,6 @@ impl IssueObject {
         Ok(labels.into_iter().map(LabelObject::from).collect())
     }
 
-    /// The milestone this issue is assigned to, if any.
     async fn milestone(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<MilestoneObject>> {
         let Some(mid) = self.milestone_id else {
             return Ok(None);

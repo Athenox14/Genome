@@ -5,7 +5,6 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Dispatches webhook deliveries for repository events.
 #[derive(Clone)]
 pub struct WebhookDispatcher {
     db: DatabaseConnection,

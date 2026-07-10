@@ -328,7 +328,6 @@ impl RepoManager {
         Ok(repo.graph_descendant_of(descendant_oid, ancestor_oid)?)
     }
 
-    /// List local branch names for a repository.
     pub fn list_branches(&self, owner: &str, name: &str) -> Result<Vec<String>> {
         let (repo, _) = self.open(owner, name)?;
         let mut out = Vec::new();
@@ -341,7 +340,6 @@ impl RepoManager {
         Ok(out)
     }
 
-    /// List tag names for a repository.
     pub fn list_tags(&self, owner: &str, name: &str) -> Result<Vec<String>> {
         let (repo, _) = self.open(owner, name)?;
         let tag_names = repo.tag_names(None)?;
@@ -383,7 +381,6 @@ impl RepoManager {
         Ok(commit)
     }
 
-    /// Read the raw bytes of a file at a given ref and path.
     pub fn read_file_at_ref(
         &self,
         owner: &str,
@@ -592,7 +589,6 @@ impl RepoManager {
             return Ok(source_commit.id().to_string());
         }
 
-        // Real merge commit.
         let base_oid = repo.merge_base(target_commit.id(), source_commit.id())?;
         let base_commit = repo.find_commit(base_oid)?;
 

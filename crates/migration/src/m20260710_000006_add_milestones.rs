@@ -11,7 +11,6 @@ impl MigrationName for Migration {
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // milestones
         manager
             .create_table(
                 Table::create()
@@ -49,7 +48,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // issues.milestone_id
         manager
             .alter_table(
                 Table::alter()

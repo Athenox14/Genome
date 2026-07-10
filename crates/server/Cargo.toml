@@ -31,5 +31,5 @@ async-graphql-axum = { workspace = true }
 async-graphql = { workspace = true }
 futures-util = { workspace = true }
 bollard = { workspace = true }
-dashmap = { workspace = true }
 async-trait = "0.1"
+tower_governor = { version = "0.4", default-features = false, features = ["axum"] }

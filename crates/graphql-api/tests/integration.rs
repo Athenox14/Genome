@@ -320,7 +320,6 @@ async fn create_repository_inserts_row_and_creates_bare_repo_on_disk() {
     assert_eq!(data["createRepository"]["name"], json!(repo_name));
     assert_eq!(data["createRepository"]["isPrivate"], json!(true));
 
-    // DB row exists.
     let repo_row = entity::prelude::Repository::find()
         .filter(entity::repository::Column::Name.eq(repo_name.clone()))
         .filter(entity::repository::Column::OwnerId.eq(user.id))

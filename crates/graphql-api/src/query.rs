@@ -103,7 +103,6 @@ impl QueryRoot {
     ) -> async_graphql::Result<Option<RepositoryObject>> {
         let app = ctx.data::<AppContext>()?;
 
-        // Resolve owner login -> (owner_type, owner_id).
         let user = entity::prelude::User::find()
             .filter(entity::user::Column::Username.eq(owner.clone()))
             .one(&app.db)

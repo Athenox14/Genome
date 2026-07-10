@@ -11,7 +11,6 @@ impl MigrationName for Migration {
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // users
         manager
             .create_table(
                 Table::create()
@@ -57,7 +56,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // ssh_keys
         manager
             .create_table(
                 Table::create()
@@ -84,7 +82,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // organizations
         manager
             .create_table(
                 Table::create()
@@ -117,7 +114,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // org_members
         manager
             .create_table(
                 Table::create()
@@ -149,7 +145,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // repositories
         manager
             .create_table(
                 Table::create()
@@ -202,7 +197,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // repo_collaborators
         manager
             .create_table(
                 Table::create()
@@ -238,7 +232,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // labels
         manager
             .create_table(
                 Table::create()
@@ -259,7 +252,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // issues
         manager
             .create_table(
                 Table::create()
@@ -312,7 +304,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // issue_labels
         manager
             .create_table(
                 Table::create()
@@ -343,7 +334,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // issue_comments
         manager
             .create_table(
                 Table::create()
@@ -381,7 +371,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // pull_requests
         manager
             .create_table(
                 Table::create()
@@ -451,7 +440,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // pr_reviews
         manager
             .create_table(
                 Table::create()
@@ -490,7 +478,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // webhooks
         manager
             .create_table(
                 Table::create()
@@ -523,7 +510,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // workflow_runs
         manager
             .create_table(
                 Table::create()
@@ -566,7 +552,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // workflow_jobs
         manager
             .create_table(
                 Table::create()
@@ -598,7 +583,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // dev_workspaces
         manager
             .create_table(
                 Table::create()
@@ -644,7 +628,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // access_tokens
         manager
             .create_table(
                 Table::create()
