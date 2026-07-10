@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::context::{AppContext, RequestContext};
 use crate::types::{
     ActivityEventObject, DevWorkspaceObject, IssueObject, NotificationObject, OrganizationObject,
-    RepositoryObject, SearchResults, UserObject,
+    PackageObject, RepositoryObject, SearchResults, UserObject,
 };
 
 pub struct QueryRoot;
@@ -260,6 +260,22 @@ impl QueryRoot {
             .all(&app.db)
             .await?;
         Ok(events.into_iter().map(ActivityEventObject::from).collect())
+    }
+
+    /// Packages published by the current authenticated user.
+    async fn my_packages(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<PackageObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let Some(claims) = &req.user else {
+            return Err(async_graphql::Error::new("unauthenticated"));
+        };
+
+        let packages = entity::prelude::Package::find()
+            .filter(entity::package::Column::OwnerId.eq(claims.sub))
+            .order_by_desc(entity::package::Column::CreatedAt)
+            .all(&app.db)
+            .await?;
+        Ok(packages.into_iter().map(PackageObject::from).collect())
     }
 
     /// Basic ILIKE-based search across repositories, issues, and users.

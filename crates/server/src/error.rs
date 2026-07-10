@@ -13,6 +13,9 @@ pub enum ServerError {
     #[error("unauthorized")]
     Unauthorized,
 
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     #[error("git error: {0}")]
     Git(#[from] git_core::GitCoreError),
 
@@ -32,6 +35,7 @@ impl IntoResponse for ServerError {
             ServerError::NotFound(_) => StatusCode::NOT_FOUND,
             ServerError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ServerError::Conflict(_) => StatusCode::CONFLICT,
             ServerError::Git(git_core::GitCoreError::RepoNotFound(_))
             | ServerError::Git(git_core::GitCoreError::RefNotFound(_))
             | ServerError::Git(git_core::GitCoreError::PathNotFound(_)) => StatusCode::NOT_FOUND,

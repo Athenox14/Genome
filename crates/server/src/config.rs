@@ -21,6 +21,13 @@ pub struct Config {
     pub ssh_listen_addr: String,
     /// Path to the persisted SSH host key (generated on first run).
     pub ssh_host_key_path: String,
+    /// Base URL of the frontend app, used to build the `/login?then=...`
+    /// redirect for unauthenticated `GET /oauth/authorize` requests.
+    pub frontend_url: String,
+    /// Root directory under which uploaded packages are stored, as
+    /// `{packages_root_path}/{owner}/{name}/{version}/{filename}`. Defaults
+    /// to a `packages` directory alongside `repos_root_path`.
+    pub packages_root_path: String,
 }
 
 impl Config {
@@ -49,6 +56,17 @@ impl Config {
         let ssh_host_key_path = std::env::var("SSH_HOST_KEY_PATH")
             .unwrap_or_else(|_| "./data/ssh_host_key".to_string());
 
+        let frontend_url =
+            std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+        let packages_root_path = std::env::var("PACKAGES_ROOT_PATH").unwrap_or_else(|_| {
+            std::path::Path::new(&repos_root_path)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("packages")
+                .to_string_lossy()
+                .to_string()
+        });
+
         Ok(Config {
             database_url,
             jwt_secret,
@@ -58,6 +76,8 @@ impl Config {
             secrets_encryption_key,
             ssh_listen_addr,
             ssh_host_key_path,
+            frontend_url,
+            packages_root_path,
         })
     }
 }

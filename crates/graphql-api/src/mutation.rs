@@ -10,9 +10,9 @@ use crate::context::{AppContext, RequestContext};
 use crate::types::{
     resolve_owner_login, AuthPayload, BranchProtectionRuleObject, DevWorkspaceObject,
     IssueCommentObject, IssueObject, LabelObject, MilestoneObject, NotificationObject,
-    OrganizationObject, PrReviewCommentObject, PrReviewObject, ProjectCardObject,
-    ProjectColumnObject, ProjectObject, PullRequestObject, RepositoryObject, TwoFactorSetup,
-    UserObject, WorkflowRunObject,
+    OAuth2ApplicationCreated, OrganizationObject, PrReviewCommentObject, PrReviewObject,
+    ProjectCardObject, ProjectColumnObject, ProjectObject, PullRequestObject, RepositoryObject,
+    TwoFactorSetup, UserObject, WorkflowRunObject,
 };
 
 const TOTP_ISSUER: &str = "Genome";
@@ -437,6 +437,7 @@ impl MutationRoot {
             description: Set(description),
             is_private: Set(is_private),
             default_branch: Set("main".to_string()),
+            forked_from_id: Set(None),
             created_at: Set(Utc::now()),
         };
         let repo = repo.insert(&app.db).await?;
@@ -474,6 +475,72 @@ impl MutationRoot {
             .await?;
 
         Ok(true)
+    }
+
+    /// Forks a repository into a new repository owned by the current user,
+    /// with the same name as the source. Errors if the current user already
+    /// owns a repository with that name.
+    async fn fork_repository(&self, ctx: &Context<'_>, repo_id: Uuid) -> async_graphql::Result<RepositoryObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let source_repo = find_repo(app, repo_id).await?;
+        let perm = repo_permission(app, &source_repo, claims.sub).await?;
+        if perm.is_none() {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let dest_owner = entity::prelude::User::find_by_id(claims.sub)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("user not found"))?;
+
+        let existing = entity::prelude::Repository::find()
+            .filter(entity::repository::Column::OwnerType.eq("user"))
+            .filter(entity::repository::Column::OwnerId.eq(dest_owner.id))
+            .filter(entity::repository::Column::Name.eq(source_repo.name.clone()))
+            .one(&app.db)
+            .await?;
+        if existing.is_some() {
+            return Err(async_graphql::Error::new(format!(
+                "you already own a repository named '{}'",
+                source_repo.name
+            )));
+        }
+
+        let source_owner_login =
+            resolve_owner_login(&app.db, &source_repo.owner_type, source_repo.owner_id)
+                .await
+                .unwrap_or_default();
+
+        app.repo_manager
+            .fork_repo(&source_owner_login, &source_repo.name, &dest_owner.username, &source_repo.name)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        let repo = entity::repository::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            owner_type: Set("user".to_string()),
+            owner_id: Set(dest_owner.id),
+            name: Set(source_repo.name.clone()),
+            description: Set(source_repo.description.clone()),
+            is_private: Set(source_repo.is_private),
+            default_branch: Set(source_repo.default_branch.clone()),
+            created_at: Set(Utc::now()),
+            forked_from_id: Set(Some(source_repo.id)),
+        };
+        let repo = repo.insert(&app.db).await?;
+
+        record_activity(
+            app,
+            Some(repo.id),
+            claims.sub,
+            entity::activity_event::kind::REPO_CREATED,
+            format!("{} forked repository {}", dest_owner.username, repo.name),
+        )
+        .await;
+
+        Ok(RepositoryObject::from_model(&app.db, repo).await)
     }
 
     async fn create_issue(
@@ -666,7 +733,12 @@ impl MutationRoot {
     /// Merges a pull request: performs an actual git merge (fast-forward or
     /// merge commit) of `source_branch` into `target_branch` via git-core,
     /// then marks the PR as merged in the database.
-    async fn merge_pull_request(&self, ctx: &Context<'_>, pr_id: Uuid) -> async_graphql::Result<PullRequestObject> {
+    async fn merge_pull_request(
+        &self,
+        ctx: &Context<'_>,
+        pr_id: Uuid,
+        merge_method: Option<String>,
+    ) -> async_graphql::Result<PullRequestObject> {
         let app = ctx.data::<AppContext>()?;
         let req = ctx.data::<RequestContext>()?;
         let claims = require_user(req)?;
@@ -720,15 +792,42 @@ impl MutationRoot {
 
         let author_email = format!("{}@users.noreply.local", claims.username);
 
-        match app.repo_manager.merge_branches(
-            &owner_login,
-            &repo.name,
-            &pr.source_branch,
-            &pr.target_branch,
-            &claims.username,
-            &author_email,
-            &message,
-        ) {
+        let merge_method = merge_method.unwrap_or_else(|| "merge".to_string());
+        let merge_result = match merge_method.as_str() {
+            "merge" => app.repo_manager.merge_branches(
+                &owner_login,
+                &repo.name,
+                &pr.source_branch,
+                &pr.target_branch,
+                &claims.username,
+                &author_email,
+                &message,
+            ),
+            "squash" => app.repo_manager.squash_merge(
+                &owner_login,
+                &repo.name,
+                &pr.source_branch,
+                &pr.target_branch,
+                &claims.username,
+                &author_email,
+                &message,
+            ),
+            "rebase" => app.repo_manager.rebase_merge(
+                &owner_login,
+                &repo.name,
+                &pr.source_branch,
+                &pr.target_branch,
+                &claims.username,
+                &author_email,
+            ),
+            other => {
+                return Err(async_graphql::Error::new(format!(
+                    "unknown merge method '{other}'; expected 'merge', 'squash', or 'rebase'"
+                )));
+            }
+        };
+
+        match merge_result {
             Ok(_) => {}
             Err(git_core::GitCoreError::MergeConflict(_, _)) => {
                 return Err(async_graphql::Error::new(
@@ -1078,15 +1177,35 @@ impl MutationRoot {
         let executor = app.actions_executor.clone();
         let jobs: Vec<_> = workflow.jobs.into_values().collect();
         let secrets = load_repo_secrets(app, repo_id).await.unwrap_or_default();
+        let run_id = run.id;
+        let db = app.db.clone();
         tokio::spawn(async move {
             for job in jobs {
                 let result = executor
-                    .run_job(&job, &[], Default::default(), &secrets, |line| {
+                    .run_job(run_id, &job, &[], Default::default(), &secrets, |line| {
                         tracing::info!(target: "workflow", "{line}");
                     })
                     .await;
-                if let Err(e) = result {
-                    tracing::warn!("workflow job failed: {e}");
+                match result {
+                    Ok(job_result) => {
+                        for artifact in &job_result.artifacts {
+                            let row = entity::workflow_artifact::ActiveModel {
+                                id: Set(Uuid::new_v4()),
+                                run_id: Set(run_id),
+                                job_id: Set(None),
+                                name: Set(artifact.name.clone()),
+                                file_path: Set(artifact.file_path.clone()),
+                                size_bytes: Set(artifact.size_bytes),
+                                created_at: Set(Utc::now()),
+                            };
+                            if let Err(e) = row.insert(&db).await {
+                                tracing::warn!("failed to insert workflow_artifact: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("workflow job failed: {e}");
+                    }
                 }
             }
         });
@@ -1578,5 +1697,89 @@ impl MutationRoot {
         }
 
         Ok(true)
+    }
+
+    /// Creates or updates the mirror configuration for a repository: a
+    /// background task (see `crates/server/src/main.rs`) periodically fetches
+    /// from `remote_url` into the repository's bare git directory. Requires
+    /// Admin permission on the repository.
+    async fn set_repo_mirror(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        remote_url: String,
+        sync_interval_minutes: Option<i32>,
+    ) -> async_graphql::Result<bool> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let repo = find_repo(app, repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm != Some(Permission::Admin) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let sync_interval_minutes = sync_interval_minutes.unwrap_or(60);
+
+        let existing = entity::prelude::RepoMirror::find()
+            .filter(entity::repo_mirror::Column::RepoId.eq(repo_id))
+            .one(&app.db)
+            .await?;
+
+        if let Some(existing) = existing {
+            let mut active: entity::repo_mirror::ActiveModel = existing.into();
+            active.remote_url = Set(remote_url);
+            active.sync_interval_minutes = Set(sync_interval_minutes);
+            active.update(&app.db).await?;
+        } else {
+            let mirror = entity::repo_mirror::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                repo_id: Set(repo_id),
+                remote_url: Set(remote_url),
+                last_synced_at: Set(None),
+                sync_interval_minutes: Set(sync_interval_minutes),
+                created_at: Set(Utc::now()),
+            };
+            mirror.insert(&app.db).await?;
+        }
+
+        Ok(true)
+    }
+
+    /// Registers a new OAuth2 application owned by the current user, acting
+    /// as a third-party client of Genome's own OAuth2 provider (the reverse
+    /// of "login via Google" — here Genome is the identity provider). The
+    /// plaintext `client_secret` is returned exactly once; only its hash is
+    /// persisted, following the same `generate_access_token`/`hash_token`
+    /// pattern used for personal access tokens.
+    async fn create_oauth2_application(
+        &self,
+        ctx: &Context<'_>,
+        name: String,
+        redirect_uri: String,
+    ) -> async_graphql::Result<OAuth2ApplicationCreated> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let client_id = format!("genome_client_{}", Uuid::new_v4().simple());
+        let (client_secret, client_secret_hash) = auth::generate_access_token();
+
+        let application = entity::oauth2_application::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            owner_id: Set(claims.sub),
+            name: Set(name),
+            client_id: Set(client_id.clone()),
+            client_secret_hash: Set(client_secret_hash),
+            redirect_uri: Set(redirect_uri),
+            created_at: Set(Utc::now()),
+        };
+        application.insert(&app.db).await?;
+
+        Ok(OAuth2ApplicationCreated {
+            client_id,
+            client_secret,
+        })
     }
 }

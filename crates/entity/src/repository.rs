@@ -15,6 +15,7 @@ pub struct Model {
     #[sea_orm(default_value = "main")]
     pub default_branch: String,
     pub created_at: ChronoDateTimeUtc,
+    pub forked_from_id: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

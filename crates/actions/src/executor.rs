@@ -1,14 +1,17 @@
 //! Docker-based execution of a single workflow job via `bollard`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use bollard::container::{
-    Config, CreateContainerOptions, RemoveContainerOptions, UploadToContainerOptions,
+    Config, CreateContainerOptions, DownloadFromContainerOptions, RemoveContainerOptions,
+    UploadToContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::Docker;
 use futures_util::StreamExt;
+use uuid::Uuid;
 
 use crate::workflow::Job;
 use crate::ActionsError;
@@ -20,25 +23,38 @@ pub enum JobStatus {
     Failure,
 }
 
+/// Metadata for a single artifact collected from a job's container after a
+/// successful run, produced by a `uses: genome/upload-artifact` step.
+#[derive(Debug, Clone)]
+pub struct ArtifactMeta {
+    pub name: String,
+    pub file_path: String,
+    pub size_bytes: i64,
+}
+
 /// Result of running a job to completion.
 #[derive(Debug, Clone)]
 pub struct JobResult {
     pub status: JobStatus,
     pub exit_code: i32,
+    pub artifacts: Vec<ArtifactMeta>,
 }
 
 /// Executes workflow jobs inside disposable Docker containers.
 pub struct Executor {
     docker: Docker,
+    /// Base directory under which per-run artifact tarballs are written:
+    /// `{artifacts_root}/{run_id}/{artifact_name}.tar`.
+    artifacts_root: PathBuf,
 }
 
 impl Executor {
     /// Connect to the local Docker daemon using platform defaults
     /// (named pipe on Windows, unix socket elsewhere).
-    pub fn new() -> Result<Executor, ActionsError> {
+    pub fn new(artifacts_root: PathBuf) -> Result<Executor, ActionsError> {
         let docker =
             Docker::connect_with_local_defaults().map_err(ActionsError::Docker)?;
-        Ok(Executor { docker })
+        Ok(Executor { docker, artifacts_root })
     }
 
     /// Map a `runs-on:` value to a concrete Docker image tag.
@@ -65,6 +81,7 @@ impl Executor {
     /// is produced.
     pub async fn run_job(
         &self,
+        run_id: Uuid,
         job: &Job,
         workdir_repo_archive: &[u8],
         env_extra: HashMap<String, String>,
@@ -255,7 +272,53 @@ impl Executor {
                 return Ok(JobResult {
                     status: JobStatus::Failure,
                     exit_code,
+                    artifacts: Vec::new(),
                 });
+            }
+        }
+
+        // Collect any declared artifacts only when every step succeeded, and
+        // before the container is torn down (the artifact's files only exist
+        // inside the now-finished container).
+        let mut artifacts = Vec::new();
+        if last_exit_code == 0 {
+            for step in &job.steps {
+                let Some(uses) = &step.uses else { continue };
+                if uses != "genome/upload-artifact" {
+                    continue;
+                }
+                let Some(with) = &step.with else {
+                    log_sink(
+                        "[artifact] genome/upload-artifact step missing 'with: {name, path}'"
+                            .to_string(),
+                    );
+                    continue;
+                };
+                let name = with.get("name").and_then(|v| v.as_str());
+                let path = with.get("path").and_then(|v| v.as_str());
+                let (Some(name), Some(path)) = (name, path) else {
+                    log_sink(
+                        "[artifact] genome/upload-artifact step requires both 'name' and 'path'"
+                            .to_string(),
+                    );
+                    continue;
+                };
+
+                match self
+                    .download_artifact(&container_name, run_id, name, path)
+                    .await
+                {
+                    Ok(meta) => {
+                        log_sink(format!(
+                            "[artifact] collected '{}' ({} bytes)",
+                            meta.name, meta.size_bytes
+                        ));
+                        artifacts.push(meta);
+                    }
+                    Err(e) => {
+                        log_sink(format!("[artifact] failed to collect '{name}': {e}"));
+                    }
+                }
             }
         }
 
@@ -268,6 +331,47 @@ impl Executor {
                 JobStatus::Failure
             },
             exit_code: last_exit_code,
+            artifacts,
+        })
+    }
+
+    /// Downloads `container_path` out of the (still-running) container as a
+    /// tar stream and writes it verbatim to
+    /// `{artifacts_root}/{run_id}/{name}.tar`, returning its metadata.
+    async fn download_artifact(
+        &self,
+        container_name: &str,
+        run_id: Uuid,
+        name: &str,
+        container_path: &str,
+    ) -> Result<ArtifactMeta, ActionsError> {
+        let mut stream = self.docker.download_from_container(
+            container_name,
+            Some(DownloadFromContainerOptions {
+                path: container_path.to_string(),
+            }),
+        );
+
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(ActionsError::Docker)?;
+            bytes.extend_from_slice(&chunk);
+        }
+
+        let run_dir = self.artifacts_root.join(run_id.to_string());
+        tokio::fs::create_dir_all(&run_dir)
+            .await
+            .map_err(|e| ActionsError::Artifact(e.to_string()))?;
+
+        let file_path = run_dir.join(format!("{name}.tar"));
+        tokio::fs::write(&file_path, &bytes)
+            .await
+            .map_err(|e| ActionsError::Artifact(e.to_string()))?;
+
+        Ok(ArtifactMeta {
+            name: name.to_string(),
+            file_path: file_path.to_string_lossy().to_string(),
+            size_bytes: bytes.len() as i64,
         })
     }
 }

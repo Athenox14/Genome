@@ -13,6 +13,7 @@ pub struct UserObject {
     pub is_admin: bool,
     pub avatar_url: Option<String>,
     pub created_at: DateTime<Utc>,
+    pub deactivated_at: Option<DateTime<Utc>>,
 }
 
 impl From<entity::user::Model> for UserObject {
@@ -24,6 +25,7 @@ impl From<entity::user::Model> for UserObject {
             is_admin: m.is_admin,
             avatar_url: m.avatar_url,
             created_at: m.created_at,
+            deactivated_at: m.deactivated_at,
         }
     }
 }
@@ -136,6 +138,17 @@ impl RepositoryObject {
         Ok(runs.into_iter().map(WorkflowRunObject::from).collect())
     }
 
+    /// Packages published against this repository.
+    async fn packages(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<PackageObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let packages = entity::prelude::Package::find()
+            .filter(entity::package::Column::RepoId.eq(self.id))
+            .order_by_desc(entity::package::Column::CreatedAt)
+            .all(&app.db)
+            .await?;
+        Ok(packages.into_iter().map(PackageObject::from).collect())
+    }
+
     /// Names of the Actions secrets configured for this repository. Values
     /// are never exposed via GraphQL (write-only, standard practice).
     async fn secret_names(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<String>> {
@@ -231,9 +244,40 @@ impl RepositoryObject {
             .await?;
         Ok(events.into_iter().map(ActivityEventObject::from).collect())
     }
+
+    /// Labels defined for this repository.
+    async fn labels(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<LabelObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let labels = entity::prelude::Label::find()
+            .filter(entity::label::Column::RepoId.eq(self.id))
+            .all(&app.db)
+            .await?;
+        Ok(labels.into_iter().map(LabelObject::from).collect())
+    }
+
+    /// Milestones defined for this repository.
+    async fn milestones(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<MilestoneObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let milestones = entity::prelude::Milestone::find()
+            .filter(entity::milestone::Column::RepoId.eq(self.id))
+            .all(&app.db)
+            .await?;
+        Ok(milestones.into_iter().map(MilestoneObject::from).collect())
+    }
+
+    /// Kanban projects for this repository.
+    async fn projects(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<ProjectObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let projects = entity::prelude::Project::find()
+            .filter(entity::project::Column::RepoId.eq(self.id))
+            .all(&app.db)
+            .await?;
+        Ok(projects.into_iter().map(ProjectObject::from).collect())
+    }
 }
 
 #[derive(SimpleObject, Clone)]
+#[graphql(complex)]
 pub struct IssueObject {
     pub id: Uuid,
     pub repo_id: Uuid,
@@ -244,6 +288,8 @@ pub struct IssueObject {
     pub state: String,
     pub created_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
+    #[graphql(skip)]
+    pub milestone_id: Option<Uuid>,
 }
 
 impl From<entity::issue::Model> for IssueObject {
@@ -258,7 +304,41 @@ impl From<entity::issue::Model> for IssueObject {
             state: m.state,
             created_at: m.created_at,
             closed_at: m.closed_at,
+            milestone_id: m.milestone_id,
         }
+    }
+}
+
+#[ComplexObject]
+impl IssueObject {
+    /// Labels attached to this issue.
+    async fn labels(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<LabelObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let links = entity::prelude::IssueLabel::find()
+            .filter(entity::issue_label::Column::IssueId.eq(self.id))
+            .all(&app.db)
+            .await?;
+        let label_ids: Vec<Uuid> = links.into_iter().map(|l| l.label_id).collect();
+        if label_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let labels = entity::prelude::Label::find()
+            .filter(entity::label::Column::Id.is_in(label_ids))
+            .all(&app.db)
+            .await?;
+        Ok(labels.into_iter().map(LabelObject::from).collect())
+    }
+
+    /// The milestone this issue is assigned to, if any.
+    async fn milestone(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<MilestoneObject>> {
+        let Some(mid) = self.milestone_id else {
+            return Ok(None);
+        };
+        let app = ctx.data::<AppContext>()?;
+        let milestone = entity::prelude::Milestone::find_by_id(mid)
+            .one(&app.db)
+            .await?;
+        Ok(milestone.map(MilestoneObject::from))
     }
 }
 
@@ -336,6 +416,7 @@ impl From<entity::organization::Model> for OrganizationObject {
 }
 
 #[derive(SimpleObject, Clone)]
+#[graphql(complex)]
 pub struct WorkflowRunObject {
     pub id: Uuid,
     pub repo_id: Uuid,
@@ -358,6 +439,43 @@ impl From<entity::workflow_run::Model> for WorkflowRunObject {
             status: m.status,
             started_at: m.started_at,
             finished_at: m.finished_at,
+        }
+    }
+}
+
+#[ComplexObject]
+impl WorkflowRunObject {
+    /// Artifacts uploaded by `genome/upload-artifact` steps across this
+    /// run's jobs.
+    async fn artifacts(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<ArtifactObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let artifacts = entity::prelude::WorkflowArtifact::find()
+            .filter(entity::workflow_artifact::Column::RunId.eq(self.id))
+            .all(&app.db)
+            .await?;
+        Ok(artifacts.into_iter().map(ArtifactObject::from).collect())
+    }
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ArtifactObject {
+    pub id: Uuid,
+    pub run_id: Uuid,
+    pub job_id: Option<Uuid>,
+    pub name: String,
+    pub size_bytes: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<entity::workflow_artifact::Model> for ArtifactObject {
+    fn from(m: entity::workflow_artifact::Model) -> Self {
+        Self {
+            id: m.id,
+            run_id: m.run_id,
+            job_id: m.job_id,
+            name: m.name,
+            size_bytes: m.size_bytes,
+            created_at: m.created_at,
         }
     }
 }
@@ -471,6 +589,43 @@ impl From<entity::notification::Model> for NotificationObject {
             created_at: m.created_at,
         }
     }
+}
+
+/// Metadata for a published package. File contents are never exposed via
+/// GraphQL; they are served over the dedicated `/packages/:owner/:name/:version`
+/// HTTP routes instead.
+#[derive(SimpleObject, Clone)]
+pub struct PackageObject {
+    pub id: Uuid,
+    pub repo_id: Option<Uuid>,
+    pub name: String,
+    pub version: String,
+    pub package_type: String,
+    pub size_bytes: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<entity::package::Model> for PackageObject {
+    fn from(m: entity::package::Model) -> Self {
+        Self {
+            id: m.id,
+            repo_id: m.repo_id,
+            name: m.name,
+            version: m.version,
+            package_type: m.package_type,
+            size_bytes: m.size_bytes,
+            created_at: m.created_at,
+        }
+    }
+}
+
+/// Returned once, at creation time, from `createOAuth2Application`. The
+/// plaintext `client_secret` is never stored or retrievable again — only its
+/// hash is persisted.
+#[derive(SimpleObject, Clone)]
+pub struct OAuth2ApplicationCreated {
+    pub client_id: String,
+    pub client_secret: String,
 }
 
 #[derive(SimpleObject, Clone)]
@@ -644,6 +799,7 @@ impl From<entity::milestone::Model> for MilestoneObject {
 }
 
 #[derive(SimpleObject, Clone)]
+#[graphql(complex)]
 pub struct ProjectObject {
     pub id: Uuid,
     pub repo_id: Uuid,
@@ -662,7 +818,22 @@ impl From<entity::project::Model> for ProjectObject {
     }
 }
 
+#[ComplexObject]
+impl ProjectObject {
+    /// Columns belonging to this project, in display order.
+    async fn columns(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<ProjectColumnObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let columns = entity::prelude::ProjectColumn::find()
+            .filter(entity::project_column::Column::ProjectId.eq(self.id))
+            .order_by_asc(entity::project_column::Column::Position)
+            .all(&app.db)
+            .await?;
+        Ok(columns.into_iter().map(ProjectColumnObject::from).collect())
+    }
+}
+
 #[derive(SimpleObject, Clone)]
+#[graphql(complex)]
 pub struct ProjectColumnObject {
     pub id: Uuid,
     pub project_id: Uuid,
@@ -681,7 +852,22 @@ impl From<entity::project_column::Model> for ProjectColumnObject {
     }
 }
 
+#[ComplexObject]
+impl ProjectColumnObject {
+    /// Cards placed in this column, in display order.
+    async fn cards(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<ProjectCardObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let cards = entity::prelude::ProjectCard::find()
+            .filter(entity::project_card::Column::ColumnId.eq(self.id))
+            .order_by_asc(entity::project_card::Column::Position)
+            .all(&app.db)
+            .await?;
+        Ok(cards.into_iter().map(ProjectCardObject::from).collect())
+    }
+}
+
 #[derive(SimpleObject, Clone)]
+#[graphql(complex)]
 pub struct ProjectCardObject {
     pub id: Uuid,
     pub column_id: Uuid,
@@ -699,5 +885,18 @@ impl From<entity::project_card::Model> for ProjectCardObject {
             pull_request_id: m.pull_request_id,
             position: m.position,
         }
+    }
+}
+
+#[ComplexObject]
+impl ProjectCardObject {
+    /// The issue this card represents, if it wraps an issue rather than a PR.
+    async fn issue(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<IssueObject>> {
+        let Some(iid) = self.issue_id else {
+            return Ok(None);
+        };
+        let app = ctx.data::<AppContext>()?;
+        let issue = entity::prelude::Issue::find_by_id(iid).one(&app.db).await?;
+        Ok(issue.map(IssueObject::from))
     }
 }

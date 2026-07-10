@@ -10,8 +10,8 @@ use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post, put};
 use axum::Router;
 use migration::MigratorTrait;
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
@@ -27,10 +27,24 @@ use graphql_api::{AppContext, GraphQLSchema};
 struct ServerState {
     schema: GraphQLSchema,
     app_ctx: AppContext,
+    config: Config,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `check-push-protection` is not the HTTP server: it's a tiny CLI
+    // subcommand invoked by the `hooks/pre-receive` script that
+    // `git_core::RepoManager::init_repo` writes into every new bare repo.
+    // git runs this hook *before* updating any refs and feeds it
+    // `<old> <new> <ref>` lines on stdin for the push; a non-zero exit here
+    // aborts the whole push (true pre-receive rejection), unlike the old
+    // post-receive warning-only check.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("check-push-protection") {
+        let exit_code = run_check_push_protection(&args[2..]).await?;
+        std::process::exit(exit_code);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -41,7 +55,11 @@ async fn main() -> anyhow::Result<()> {
     migration::Migrator::up(&db, None).await?;
 
     let repo_manager = Arc::new(git_core::RepoManager::new(config.repos_root_path.clone()));
-    let actions_executor = Arc::new(actions::Executor::new()?);
+    let artifacts_root = std::path::Path::new(&config.repos_root_path)
+        .parent()
+        .map(|p| p.join("artifacts"))
+        .unwrap_or_else(|| std::path::PathBuf::from("./artifacts"));
+    let actions_executor = Arc::new(actions::Executor::new(artifacts_root)?);
     let workspace_manager = Arc::new(dev_env::WorkspaceManager::connect_local()?);
     let webhook_dispatcher = Arc::new(webhooks::WebhookDispatcher::new(db.clone()));
 
@@ -56,10 +74,15 @@ async fn main() -> anyhow::Result<()> {
 
     let schema = graphql_api::build_schema(app_ctx.clone());
 
-    let state = ServerState { schema, app_ctx: app_ctx.clone() };
+    let state = ServerState {
+        schema,
+        app_ctx: app_ctx.clone(),
+        config: config.clone(),
+    };
     let limiter = rate_limit::RateLimiter::new();
 
-    tokio::spawn(auto_stop_dev_workspaces(app_ctx));
+    tokio::spawn(auto_stop_dev_workspaces(app_ctx.clone()));
+    tokio::spawn(sync_repo_mirrors(app_ctx));
 
     // CORS is intentionally permissive (the frontend runs on a different
     // port/origin by design). `CorsLayer::permissive()` allows any origin,
@@ -90,6 +113,19 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/workspaces/:id/proxy/*path",
             get(workspace_proxy_handler).post(workspace_proxy_handler),
+        )
+        .route(
+            "/oauth/authorize",
+            get(oauth_authorize_handler),
+        )
+        .route("/oauth/token", post(oauth_token_handler))
+        .route(
+            "/packages/:owner/:name/:version",
+            put(package_upload_handler).get(package_download_handler),
+        )
+        .route(
+            "/artifacts/:id/download",
+            get(download_artifact_handler),
         )
         .layer(middleware::from_fn_with_state(
             limiter,
@@ -254,13 +290,6 @@ async fn receive_pack_handler(
                 tracing::warn!("post-push workflow processing failed: {e}");
             }
         });
-
-        let app_ctx = state.app_ctx.clone();
-        let owner_clone = owner.clone();
-        let repo_clone = repo_name.clone();
-        tokio::spawn(async move {
-            check_force_push_against_protection(app_ctx, owner_clone, repo_clone, changes).await;
-        });
     }
 
     let content_type =
@@ -406,16 +435,32 @@ async fn process_push_workflows(
                 let job = job.clone();
                 let archive = archive.clone();
                 let result = executor
-                    .run_job(&job, &archive, env_extra, &secrets, |line| {
+                    .run_job(run_model.id, &job, &archive, env_extra, &secrets, |line| {
                         tracing::info!("[workflow] {line}");
                     })
                     .await;
 
                 let status = match result {
-                    Ok(job_result) => match job_result.status {
-                        actions::JobStatus::Success => entity::workflow_run::status::SUCCESS,
-                        actions::JobStatus::Failure => entity::workflow_run::status::FAILURE,
-                    },
+                    Ok(job_result) => {
+                        for artifact in &job_result.artifacts {
+                            let row = entity::workflow_artifact::ActiveModel {
+                                id: Set(Uuid::new_v4()),
+                                run_id: Set(run_model.id),
+                                job_id: Set(None),
+                                name: Set(artifact.name.clone()),
+                                file_path: Set(artifact.file_path.clone()),
+                                size_bytes: Set(artifact.size_bytes),
+                                created_at: Set(chrono::Utc::now()),
+                            };
+                            if let Err(e) = row.insert(&app_ctx.db).await {
+                                tracing::warn!("failed to insert workflow_artifact: {e}");
+                            }
+                        }
+                        match job_result.status {
+                            actions::JobStatus::Success => entity::workflow_run::status::SUCCESS,
+                            actions::JobStatus::Failure => entity::workflow_run::status::FAILURE,
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!("job execution failed: {e}");
                         entity::workflow_run::status::FAILURE
@@ -435,86 +480,146 @@ async fn process_push_workflows(
     Ok(())
 }
 
-/// Best-effort force-push detection for protected branches.
+/// The `check-push-protection` CLI subcommand, invoked by the
+/// `hooks/pre-receive` script written into every bare repo by
+/// `git_core::RepoManager::init_repo`. Git runs this *before* updating any
+/// refs and pipes one `<old-sha> <new-sha> <ref-name>` line per updated ref
+/// into our stdin. Returning a non-zero exit code here makes git abort the
+/// entire push -- no refs are updated -- which is true pre-receive
+/// rejection, unlike the old post-receive warning that ran after
+/// `git-receive-pack` had already accepted the push.
 ///
-/// By the time this runs, `git-receive-pack` has already accepted the push
-/// (git's real force-push rejection happens in a pre-receive hook, which
-/// would require running a hook binary as part of `handle_service_rpc` — a
-/// larger change than warranted here). Instead we compare each updated ref's
-/// old/new tips: if the old tip is not an ancestor of the new tip, history
-/// was rewritten (a force push). If that ref is a branch matching an active
-/// `branch_protection_rules` row with `block_force_push` set, we log a
-/// warning so operators/audits can see the violation. This does not undo or
-/// block the push.
-async fn check_force_push_against_protection(
-    app_ctx: AppContext,
-    owner: String,
-    repo: String,
-    changes: Vec<(String, String, String)>,
-) {
-    const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+/// Expected args (order-independent): `--repo-path <path> --owner <owner>
+/// --name <name>`.
+///
+/// SCOPE NOTE: only repos created after this change ships have the hook
+/// installed (see the doc comment on `write_pre_receive_hook` in
+/// `git-core`); pre-existing repos are not retroactively protected.
+async fn run_check_push_protection(args: &[String]) -> anyhow::Result<i32> {
+    let mut repo_path: Option<std::path::PathBuf> = None;
+    let mut owner: Option<String> = None;
+    let mut name: Option<String> = None;
 
-    let repo_row = match entity::prelude::Repository::find()
-        .filter(entity::repository::Column::Name.eq(repo.clone()))
-        .one(&app_ctx.db)
-        .await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!("branch protection check: failed to load repository row: {e}");
-            return;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--repo-path" if i + 1 < args.len() => {
+                repo_path = Some(std::path::PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--owner" if i + 1 < args.len() => {
+                owner = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--name" if i + 1 < args.len() => {
+                name = Some(args[i + 1].clone());
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
         }
-    };
-
-    let rules = match entity::prelude::BranchProtectionRule::find()
-        .filter(entity::branch_protection_rule::Column::RepoId.eq(repo_row.id))
-        .all(&app_ctx.db)
-        .await
-    {
-        Ok(rules) => rules,
-        Err(e) => {
-            tracing::warn!("branch protection check: failed to load rules: {e}");
-            return;
-        }
-    };
-    if rules.is_empty() {
-        return;
     }
 
-    for (ref_name, old_sha, new_sha) in changes {
+    let (Some(repo_path), Some(owner), Some(name)) = (repo_path, owner, name) else {
+        eprintln!(
+            "check-push-protection: usage: check-push-protection --repo-path <path> --owner <owner> --name <name>"
+        );
+        return Ok(2);
+    };
+
+    // Read all `<old> <new> <ref>` lines from stdin (git feeds every updated
+    // ref for this push before we're expected to answer).
+    let mut stdin_buf = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin_buf)?;
+    let updates: Vec<(String, String, String)> = stdin_buf
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let old_sha = parts.next()?;
+            let new_sha = parts.next()?;
+            let ref_name = parts.next()?;
+            Some((old_sha.to_string(), new_sha.to_string(), ref_name.to_string()))
+        })
+        .collect();
+
+    if updates.is_empty() {
+        return Ok(0);
+    }
+
+    const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable must be set"))?;
+    let db: DatabaseConnection = sea_orm::Database::connect(&database_url).await?;
+
+    let repo_row = entity::prelude::Repository::find()
+        .filter(entity::repository::Column::Name.eq(name.clone()))
+        .one(&db)
+        .await?;
+
+    let Some(repo_row) = repo_row else {
+        // No matching repository row (shouldn't normally happen for a repo
+        // that has a hook at all); fail open rather than blocking pushes.
+        return Ok(0);
+    };
+
+    let rules = entity::prelude::BranchProtectionRule::find()
+        .filter(entity::branch_protection_rule::Column::RepoId.eq(repo_row.id))
+        .all(&db)
+        .await?;
+
+    if rules.is_empty() {
+        return Ok(0);
+    }
+
+    // `RepoManager::is_ancestor` resolves `{root}/{owner}/{name}.git` itself,
+    // so derive `root` from the concrete `repo_path` we were given
+    // (`root/owner/name.git` -> `root`).
+    let root = repo_path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let repo_manager = git_core::RepoManager::new(root);
+
+    let mut rejected = false;
+    for (old_sha, new_sha, ref_name) in updates {
         if old_sha == ZERO_SHA || new_sha == ZERO_SHA {
-            // Branch creation or deletion, not a force-push.
+            // Branch creation or deletion: not a force-push.
             continue;
         }
         let Some(branch) = ref_name.strip_prefix("refs/heads/") else {
             continue;
         };
 
-        let Some(rule) = rules
-            .iter()
-            .find(|r| entity::branch_protection_rule::branch_matches_pattern(&r.branch_pattern, branch))
-        else {
+        let Some(rule) = rules.iter().find(|r| {
+            entity::branch_protection_rule::branch_matches_pattern(&r.branch_pattern, branch)
+        }) else {
             continue;
         };
         if !rule.block_force_push {
             continue;
         }
 
-        match app_ctx.repo_manager.is_ancestor(&owner, &repo, &old_sha, &new_sha) {
-            Ok(true) => {} // fast-forward, fine
+        match repo_manager.is_ancestor(&owner, &name, &old_sha, &new_sha) {
+            Ok(true) => {} // fast-forward: fine
             Ok(false) => {
-                tracing::warn!(
-                    "force push detected on protected branch '{branch}' of {owner}/{repo} \
-                     ({old_sha} -> {new_sha}); block_force_push is set but was not enforced \
-                     pre-receive (see check_force_push_against_protection doc comment)"
+                eprintln!(
+                    "remote: REJECTED {ref_name} ({old_sha} -> {new_sha}): \
+                     force-pushes are blocked on protected branch '{branch}'"
                 );
+                rejected = true;
             }
             Err(e) => {
-                tracing::warn!("branch protection check: failed to determine ancestry for {owner}/{repo} {branch}: {e}");
+                eprintln!(
+                    "remote: warning: could not determine fast-forward status for {branch}: {e}"
+                );
             }
         }
     }
+
+    Ok(if rejected { 1 } else { 0 })
 }
 
 fn strip_git_suffix(name: &str) -> &str {
@@ -602,6 +707,107 @@ async fn auto_stop_dev_workspaces(app_ctx: AppContext) {
     }
 }
 
+/// Background task: every 60s, fetch updates for any repo mirror whose sync
+/// interval has elapsed, via `git fetch --prune <remote_url>` run in the
+/// repository's bare directory.
+async fn sync_repo_mirrors(app_ctx: AppContext) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+
+        let now = chrono::Utc::now();
+        let mirrors = match entity::prelude::RepoMirror::find().all(&app_ctx.db).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("mirror sync: failed to list repo mirrors: {e}");
+                continue;
+            }
+        };
+
+        for mirror in mirrors {
+            let due = match mirror.last_synced_at {
+                None => true,
+                Some(last_synced_at) => {
+                    last_synced_at
+                        + chrono::Duration::minutes(mirror.sync_interval_minutes as i64)
+                        < now
+                }
+            };
+            if !due {
+                continue;
+            }
+
+            let repo = match entity::prelude::Repository::find_by_id(mirror.repo_id)
+                .one(&app_ctx.db)
+                .await
+            {
+                Ok(Some(r)) => r,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!("mirror sync: failed to load repository {}: {e}", mirror.repo_id);
+                    continue;
+                }
+            };
+
+            let owner_login = if repo.owner_type == "organization" {
+                entity::prelude::Organization::find_by_id(repo.owner_id)
+                    .one(&app_ctx.db)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|o| o.name)
+            } else {
+                entity::prelude::User::find_by_id(repo.owner_id)
+                    .one(&app_ctx.db)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|u| u.username)
+            };
+            let Some(owner_login) = owner_login else {
+                continue;
+            };
+
+            let repo_path = match app_ctx.repo_manager.repo_path(&owner_login, &repo.name) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("mirror sync: failed to resolve repo path for {}/{}: {e}", owner_login, repo.name);
+                    continue;
+                }
+            };
+
+            let result = tokio::process::Command::new("git")
+                .arg("fetch")
+                .arg("--prune")
+                .arg(&mirror.remote_url)
+                .current_dir(&repo_path)
+                .output()
+                .await;
+
+            match result {
+                Ok(output) if output.status.success() => {
+                    let mut active: entity::repo_mirror::ActiveModel = mirror.into();
+                    active.last_synced_at = Set(Some(now));
+                    if let Err(e) = active.update(&app_ctx.db).await {
+                        tracing::warn!("mirror sync: failed to update last_synced_at: {e}");
+                    }
+                }
+                Ok(output) => {
+                    tracing::warn!(
+                        "mirror sync: git fetch failed for {}/{}: {}",
+                        owner_login,
+                        repo.name,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("mirror sync: failed to spawn git fetch for {}/{}: {e}", owner_login, repo.name);
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Dev workspace proxy
 // ---------------------------------------------------------------------
@@ -658,6 +864,112 @@ async fn workspace_proxy_handler(
     Ok(response)
 }
 
+// ---------------------------------------------------------------------
+// Artifact downloads
+// ---------------------------------------------------------------------
+
+/// Streams a previously-collected workflow artifact tarball from disk,
+/// after checking the requesting user has at least read access to the
+/// repository the artifact's workflow run belongs to.
+async fn download_artifact_handler(
+    State(state): State<ServerState>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ServerResult<Response> {
+    let artifact_id = Uuid::parse_str(&id)
+        .map_err(|_| ServerError::BadRequest("invalid artifact id".to_string()))?;
+
+    let artifact = entity::prelude::WorkflowArtifact::find_by_id(artifact_id)
+        .one(&state.app_ctx.db)
+        .await?
+        .ok_or_else(|| ServerError::NotFound(format!("artifact {id} not found")))?;
+
+    let run = entity::prelude::WorkflowRun::find_by_id(artifact.run_id)
+        .one(&state.app_ctx.db)
+        .await?
+        .ok_or_else(|| ServerError::NotFound("workflow run not found".to_string()))?;
+
+    let repo = entity::prelude::Repository::find_by_id(run.repo_id)
+        .one(&state.app_ctx.db)
+        .await?
+        .ok_or_else(|| ServerError::NotFound("repository not found".to_string()))?;
+
+    let user = auth::extract_user_from_headers(&headers, &state.app_ctx.jwt_secret, None).await;
+    let user_id = user.as_ref().map(|c| c.sub);
+    let allowed = user_has_repo_read_access(&state.app_ctx.db, &repo, user_id).await?;
+    if !allowed {
+        return Err(ServerError::Unauthorized);
+    }
+
+    let data = tokio::fs::read(&artifact.file_path).await.map_err(|e| {
+        ServerError::Internal(anyhow::anyhow!(
+            "failed to read artifact file {}: {e}",
+            artifact.file_path
+        ))
+    })?;
+
+    let content_disposition = format!("attachment; filename=\"{}.tar\"", artifact.name);
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/x-tar".to_string()),
+            (header::CONTENT_DISPOSITION, content_disposition),
+        ],
+        data,
+    )
+        .into_response())
+}
+
+/// Mirrors `graphql_api::mutation::repo_permission`'s effective-permission
+/// computation (owner / org admin-or-owner / collaborator row / public
+/// visibility), collapsed to a plain read-access boolean since this route
+/// doesn't need the finer-grained `Permission` levels.
+async fn user_has_repo_read_access(
+    db: &DatabaseConnection,
+    repo: &entity::repository::Model,
+    user_id: Option<Uuid>,
+) -> ServerResult<bool> {
+    if !repo.is_private {
+        return Ok(true);
+    }
+    let Some(user_id) = user_id else {
+        return Ok(false);
+    };
+
+    let is_owner = repo.owner_type == "user" && repo.owner_id == user_id;
+
+    let is_admin_org_role = if repo.owner_type == "organization" {
+        entity::prelude::OrgMember::find()
+            .filter(entity::org_member::Column::OrgId.eq(repo.owner_id))
+            .filter(entity::org_member::Column::UserId.eq(user_id))
+            .one(db)
+            .await?
+            .map(|m| {
+                m.role == entity::org_member::role::OWNER
+                    || m.role == entity::org_member::role::ADMIN
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let collaborator_perm = entity::prelude::RepoCollaborator::find()
+        .filter(entity::repo_collaborator::Column::RepoId.eq(repo.id))
+        .filter(entity::repo_collaborator::Column::UserId.eq(user_id))
+        .one(db)
+        .await?
+        .map(|c| match c.permission.as_str() {
+            entity::repo_collaborator::permission::ADMIN => auth::Permission::Admin,
+            entity::repo_collaborator::permission::WRITE => auth::Permission::Write,
+            _ => auth::Permission::Read,
+        });
+
+    Ok(
+        auth::effective_permission(is_owner, is_admin_org_role, collaborator_perm, repo.is_private)
+            .is_some(),
+    )
+}
+
 async fn resolve_host_port(
     workspace_manager: &dev_env::WorkspaceManager,
     container_id: &str,
@@ -671,4 +983,342 @@ async fn resolve_host_port(
         .find(|h| h.container_id == container_id)
         .map(|h| h.host_port)
         .ok_or_else(|| ServerError::NotFound("workspace container not found".to_string()))
+}
+
+// ---------------------------------------------------------------------
+// OAuth2 provider
+// ---------------------------------------------------------------------
+//
+// Genome acting AS an OAuth2 identity provider for third-party apps (the
+// reverse of "login via Google"): third-party apps register an
+// `oauth2_applications` row (via the `createOAuth2Application` GraphQL
+// mutation) and then redirect users through `/oauth/authorize` to obtain a
+// short-lived authorization code, which they exchange at `/oauth/token` for
+// a bearer access token.
+//
+// NOTE (scope cut): the issued OAuth2 access tokens are not yet wired into
+// `extract_user_from_headers`/`TokenLookup`, so they cannot (currently)
+// authenticate GraphQL requests the way personal access tokens do. That
+// integration was explicitly deprioritized per the task's cut list in favor
+// of getting both HTTP routes below fully working first.
+
+/// Percent-decodes a `application/x-www-form-urlencoded` component
+/// (`+` -> space, `%XX` -> byte). Minimal, dependency-free implementation
+/// sufficient for the plain ASCII client_id/secret/code/redirect_uri values
+/// exchanged by this simplified OAuth2 flow.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(byte);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Percent-encodes a string for safe embedding as a single query-string
+/// value (e.g. the `then=` redirect target).
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Parses an `application/x-www-form-urlencoded` body into a key/value map.
+fn parse_form_body(body: &[u8]) -> HashMap<String, String> {
+    let text = String::from_utf8_lossy(body);
+    let mut map = HashMap::new();
+    for pair in text.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next().unwrap_or_default();
+        let value = parts.next().unwrap_or_default();
+        map.insert(percent_decode(key), percent_decode(value));
+    }
+    map
+}
+
+/// `GET /oauth/authorize?client_id=&redirect_uri=&response_type=code&scope=`
+///
+/// Requires the requesting user to already be authenticated (via JWT bearer
+/// token or PAT, same as GraphQL). If not authenticated, redirects (302) to
+/// the frontend's `/login?then=<url-encoded original request url>` so the
+/// user can log in and be sent back here. If authenticated: validates
+/// `client_id` exists and that `redirect_uri` matches the one stored for the
+/// application, generates a short-lived (10 minute) authorization code, and
+/// redirects (302) to `{redirect_uri}?code={code}`.
+async fn oauth_authorize_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> ServerResult<Response> {
+    let client_id = params
+        .get("client_id")
+        .cloned()
+        .ok_or_else(|| ServerError::BadRequest("missing client_id".to_string()))?;
+    let redirect_uri = params
+        .get("redirect_uri")
+        .cloned()
+        .ok_or_else(|| ServerError::BadRequest("missing redirect_uri".to_string()))?;
+
+    let user = auth::extract_user_from_headers(&headers, &state.app_ctx.jwt_secret, None).await;
+
+    let Some(claims) = user else {
+        let query = params
+            .iter()
+            .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let original_url = format!("/oauth/authorize?{query}");
+        let login_url = format!(
+            "{}/login?then={}",
+            state.config.frontend_url.trim_end_matches('/'),
+            percent_encode(&original_url)
+        );
+        return Ok(Redirect::to(&login_url).into_response());
+    };
+
+    let application = entity::prelude::Oauth2Application::find()
+        .filter(entity::oauth2_application::Column::ClientId.eq(client_id))
+        .one(&state.app_ctx.db)
+        .await?
+        .ok_or_else(|| ServerError::BadRequest("unknown client_id".to_string()))?;
+
+    if application.redirect_uri != redirect_uri {
+        return Err(ServerError::BadRequest(
+            "redirect_uri does not match the application's registered redirect_uri".to_string(),
+        ));
+    }
+
+    let (code, _) = auth::generate_access_token();
+    let code_row = entity::oauth2_authorization_code::ActiveModel {
+        code: Set(code.clone()),
+        application_id: Set(application.id),
+        user_id: Set(claims.sub),
+        redirect_uri: Set(redirect_uri.clone()),
+        expires_at: Set(chrono::Utc::now() + chrono::Duration::minutes(10)),
+        used: Set(false),
+    };
+    code_row.insert(&state.app_ctx.db).await?;
+
+    let redirect_to = format!("{redirect_uri}?code={code}");
+    Ok(Redirect::to(&redirect_to).into_response())
+}
+
+/// `POST /oauth/token` — form (`application/x-www-form-urlencoded`) or JSON
+/// body with `client_id`, `client_secret`, `code`, `redirect_uri`,
+/// `grant_type`. Validates the client credentials against the stored hash,
+/// validates the authorization code (exists, not expired, not used, matches
+/// the application and redirect_uri), marks it used, then issues a 1-hour
+/// bearer access token and returns
+/// `{access_token, token_type: "bearer", expires_in}`.
+async fn oauth_token_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ServerResult<Response> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let params: HashMap<String, String> = if content_type.contains("application/json") {
+        serde_json::from_slice(&body)
+            .map_err(|e| ServerError::BadRequest(format!("invalid JSON body: {e}")))?
+    } else {
+        parse_form_body(&body)
+    };
+
+    let get_param = |key: &str| -> ServerResult<String> {
+        params
+            .get(key)
+            .cloned()
+            .ok_or_else(|| ServerError::BadRequest(format!("missing {key}")))
+    };
+
+    let client_id = get_param("client_id")?;
+    let client_secret = get_param("client_secret")?;
+    let code = get_param("code")?;
+    let redirect_uri = get_param("redirect_uri")?;
+    let _grant_type = params.get("grant_type").cloned().unwrap_or_default();
+
+    let application = entity::prelude::Oauth2Application::find()
+        .filter(entity::oauth2_application::Column::ClientId.eq(client_id))
+        .one(&state.app_ctx.db)
+        .await?
+        .ok_or_else(|| ServerError::BadRequest("invalid client_id or client_secret".to_string()))?;
+
+    if auth::hash_token(&client_secret) != application.client_secret_hash {
+        return Err(ServerError::BadRequest(
+            "invalid client_id or client_secret".to_string(),
+        ));
+    }
+
+    let code_row = entity::prelude::Oauth2AuthorizationCode::find_by_id(code)
+        .one(&state.app_ctx.db)
+        .await?
+        .ok_or_else(|| ServerError::BadRequest("invalid or expired authorization code".to_string()))?;
+
+    if code_row.used
+        || code_row.expires_at < chrono::Utc::now()
+        || code_row.application_id != application.id
+        || code_row.redirect_uri != redirect_uri
+    {
+        return Err(ServerError::BadRequest(
+            "invalid or expired authorization code".to_string(),
+        ));
+    }
+
+    let user_id = code_row.user_id;
+    let mut used_code: entity::oauth2_authorization_code::ActiveModel = code_row.into();
+    used_code.used = Set(true);
+    used_code.update(&state.app_ctx.db).await?;
+
+    let (access_token, access_token_hash) = auth::generate_access_token();
+    const EXPIRES_IN_SECONDS: i64 = 3600;
+    let token_row = entity::oauth2_access_token::ActiveModel {
+        token_hash: Set(access_token_hash),
+        application_id: Set(application.id),
+        user_id: Set(user_id),
+        scopes: Set(String::new()),
+        expires_at: Set(chrono::Utc::now() + chrono::Duration::seconds(EXPIRES_IN_SECONDS)),
+    };
+    token_row.insert(&state.app_ctx.db).await?;
+
+    Ok(axum::Json(serde_json::json!({
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": EXPIRES_IN_SECONDS,
+    }))
+    .into_response())
+}
+
+// ---------------------------------------------------------------------
+// Package registry
+// ---------------------------------------------------------------------
+
+/// `PUT /packages/:owner/:name/:version` — authenticated upload of a raw
+/// package file. Requires the authenticated user's username to match
+/// `:owner` (no org support, per the simplified scope of this feature).
+/// Packages are immutable once published: if a row already exists for
+/// (owner, name, version) this returns 409 Conflict rather than overwriting.
+async fn package_upload_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath((owner, name, version)): AxumPath<(String, String, String)>,
+    body: Bytes,
+) -> ServerResult<Response> {
+    let claims = auth::extract_user_from_headers(&headers, &state.app_ctx.jwt_secret, None)
+        .await
+        .ok_or(ServerError::Unauthorized)?;
+    if claims.username != owner {
+        return Err(ServerError::Unauthorized);
+    }
+
+    let owner_user = entity::prelude::User::find()
+        .filter(entity::user::Column::Username.eq(owner.clone()))
+        .one(&state.app_ctx.db)
+        .await?
+        .ok_or_else(|| ServerError::NotFound(format!("user {owner} not found")))?;
+
+    let existing = entity::prelude::Package::find()
+        .filter(entity::package::Column::OwnerId.eq(owner_user.id))
+        .filter(entity::package::Column::Name.eq(name.clone()))
+        .filter(entity::package::Column::Version.eq(version.clone()))
+        .one(&state.app_ctx.db)
+        .await?;
+    if existing.is_some() {
+        return Err(ServerError::Conflict(format!(
+            "package {owner}/{name}@{version} has already been published and cannot be overwritten"
+        )));
+    }
+
+    let dir = std::path::Path::new(&state.config.packages_root_path)
+        .join(&owner)
+        .join(&name)
+        .join(&version);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| ServerError::Internal(e.into()))?;
+
+    let file_name = format!("{name}-{version}.pkg");
+    let file_path = dir.join(&file_name);
+    tokio::fs::write(&file_path, &body)
+        .await
+        .map_err(|e| ServerError::Internal(e.into()))?;
+
+    let package = entity::package::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        repo_id: Set(None),
+        owner_id: Set(owner_user.id),
+        name: Set(name),
+        version: Set(version),
+        package_type: Set("generic".to_string()),
+        file_path: Set(file_path.to_string_lossy().to_string()),
+        size_bytes: Set(body.len() as i64),
+        created_at: Set(chrono::Utc::now()),
+    };
+    package.insert(&state.app_ctx.db).await?;
+
+    Ok(StatusCode::CREATED.into_response())
+}
+
+/// `GET /packages/:owner/:name/:version` — downloads a previously published
+/// package's raw file content as `application/octet-stream`. Public: no
+/// auth required, matching Forgejo's default generic-package read behavior.
+async fn package_download_handler(
+    State(state): State<ServerState>,
+    AxumPath((owner, name, version)): AxumPath<(String, String, String)>,
+) -> ServerResult<Response> {
+    let owner_user = entity::prelude::User::find()
+        .filter(entity::user::Column::Username.eq(owner.clone()))
+        .one(&state.app_ctx.db)
+        .await?
+        .ok_or_else(|| ServerError::NotFound(format!("user {owner} not found")))?;
+
+    let package = entity::prelude::Package::find()
+        .filter(entity::package::Column::OwnerId.eq(owner_user.id))
+        .filter(entity::package::Column::Name.eq(name.clone()))
+        .filter(entity::package::Column::Version.eq(version.clone()))
+        .one(&state.app_ctx.db)
+        .await?
+        .ok_or_else(|| ServerError::NotFound(format!("package {owner}/{name}@{version} not found")))?;
+
+    let bytes = tokio::fs::read(&package.file_path)
+        .await
+        .map_err(|e| ServerError::Internal(e.into()))?;
+
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
+        .into_response())
 }

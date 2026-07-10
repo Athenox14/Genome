@@ -6,9 +6,10 @@ const router = useRouter()
 
 const username = ref('')
 const password = ref('')
+const totpCode = ref('')
 
 async function onSubmit() {
-  const ok = await auth.login(username.value, password.value)
+  const ok = await auth.login(username.value, password.value, totpCode.value || undefined)
   if (ok) {
     router.push('/')
   }
@@ -26,7 +27,8 @@ async function onSubmit() {
           v-model="username"
           type="text"
           required
-          class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+          :disabled="auth.totpRequired"
+          class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white disabled:opacity-50"
         />
       </div>
 
@@ -35,6 +37,22 @@ async function onSubmit() {
         <input
           v-model="password"
           type="password"
+          required
+          :disabled="auth.totpRequired"
+          class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white disabled:opacity-50"
+        />
+      </div>
+
+      <div v-if="auth.totpRequired">
+        <label class="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-300">
+          Two-factor authentication code
+        </label>
+        <input
+          v-model="totpCode"
+          type="text"
+          inputmode="numeric"
+          autocomplete="one-time-code"
+          placeholder="123456"
           required
           class="w-full rounded border border-gray-300 px-3 py-2 text-sm dark:bg-gray-800 dark:border-gray-700 dark:text-white"
         />
@@ -47,7 +65,7 @@ async function onSubmit() {
         :disabled="auth.loading"
         class="w-full rounded bg-gray-900 px-3 py-2 text-sm font-medium text-white hover:bg-gray-700 disabled:opacity-50"
       >
-        {{ auth.loading ? 'Logging in…' : 'Log in' }}
+        {{ auth.loading ? 'Logging in…' : (auth.totpRequired ? 'Verify code' : 'Log in') }}
       </button>
     </form>
   </div>

@@ -5,6 +5,7 @@ export interface CurrentUser {
   username: string
   email?: string | null
   avatarUrl?: string | null
+  isAdmin?: boolean
 }
 
 const TOKEN_STORAGE_KEY = 'genome_auth_token'
@@ -22,14 +23,15 @@ const TOKEN_STORAGE_KEY = 'genome_auth_token'
 //   me { id username email avatarUrl }
 // }
 const LOGIN_MUTATION = /* GraphQL */ `
-  mutation Login($username: String!, $password: String!) {
-    login(username: $username, password: $password) {
+  mutation Login($username: String!, $password: String!, $totpCode: String) {
+    login(username: $username, password: $password, totpCode: $totpCode) {
       token
       user {
         id
         username
         email
         avatarUrl
+        isAdmin
       }
     }
   }
@@ -42,6 +44,7 @@ const ME_QUERY = /* GraphQL */ `
       username
       email
       avatarUrl
+      isAdmin
     }
   }
 `
@@ -51,7 +54,8 @@ export const useAuthStore = defineStore('auth', {
     token: null as string | null,
     user: null as CurrentUser | null,
     loading: false,
-    error: null as string | null
+    error: null as string | null,
+    totpRequired: false
   }),
 
   getters: {
@@ -75,9 +79,10 @@ export const useAuthStore = defineStore('auth', {
       }
     },
 
-    async login(username: string, password: string) {
+    async login(username: string, password: string, totpCode?: string) {
       this.loading = true
       this.error = null
+      this.totpRequired = false
       const config = useRuntimeConfig()
       try {
         const res = await $fetch<{
@@ -87,12 +92,23 @@ export const useAuthStore = defineStore('auth', {
           method: 'POST',
           body: {
             query: LOGIN_MUTATION,
-            variables: { username, password }
+            variables: { username, password, totpCode: totpCode || null }
           }
         })
 
         if (res.errors?.length) {
-          throw new Error(res.errors[0].message)
+          const message = res.errors[0].message
+          if (message === 'totp_required') {
+            this.totpRequired = true
+            this.error = totpCode ? null : 'Enter your two-factor authentication code'
+            return false
+          }
+          if (message === 'totp_invalid') {
+            this.totpRequired = true
+            this.error = 'Invalid two-factor authentication code'
+            return false
+          }
+          throw new Error(message)
         }
 
         const payload = res.data?.login
