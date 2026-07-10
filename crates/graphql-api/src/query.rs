@@ -1,14 +1,14 @@
 use async_graphql::{Context, Object};
 use sea_orm::{
-    sea_query::extension::postgres::PgExpr, sea_query::Expr, ColumnTrait, Condition, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    sea_query::Expr, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect,
 };
 use uuid::Uuid;
 
 use crate::context::{AppContext, RequestContext};
 use crate::types::{
     ActivityEventObject, DevWorkspaceObject, IssueObject, NotificationObject, OrganizationObject,
-    PackageObject, RepositoryObject, SearchResults, UserObject,
+    PackageObject, RepositoryObject, SearchResults, SshKeyObject, UserObject,
 };
 
 pub struct QueryRoot;
@@ -26,6 +26,20 @@ impl QueryRoot {
             .one(&app.db)
             .await?;
         Ok(user.map(UserObject::from))
+    }
+
+    /// The current user's registered SSH public keys (for git-over-SSH auth).
+    async fn my_ssh_keys(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<SshKeyObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let Some(claims) = &req.user else {
+            return Err(async_graphql::Error::new("unauthenticated"));
+        };
+        let keys = entity::prelude::SshKey::find()
+            .filter(entity::ssh_key::Column::UserId.eq(claims.sub))
+            .all(&app.db)
+            .await?;
+        Ok(keys.into_iter().map(SshKeyObject::from).collect())
     }
 
     /// Look up a user by username.

@@ -232,6 +232,48 @@ impl MutationRoot {
         Ok(UserObject::from(user))
     }
 
+    /// Register an SSH public key for the current user, enabling
+    /// `git clone`/`push` over SSH against the ssh-server (default port
+    /// 2222) using that key for authentication.
+    async fn add_ssh_key(
+        &self,
+        ctx: &Context<'_>,
+        title: String,
+        public_key: String,
+    ) -> async_graphql::Result<crate::types::SshKeyObject> {
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+        let app = ctx.data::<AppContext>()?;
+
+        let fingerprint = auth::ssh_key_fingerprint(public_key.trim())
+            .map_err(|e| async_graphql::Error::new(format!("invalid SSH public key: {e}")))?;
+
+        let key = entity::ssh_key::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            user_id: Set(claims.sub),
+            title: Set(title),
+            public_key: Set(public_key),
+            fingerprint: Set(fingerprint),
+            created_at: Set(Utc::now()),
+        };
+        let key = key.insert(&app.db).await?;
+        Ok(crate::types::SshKeyObject::from(key))
+    }
+
+    /// Remove one of the current user's SSH keys.
+    async fn remove_ssh_key(&self, ctx: &Context<'_>, key_id: Uuid) -> async_graphql::Result<bool> {
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+        let app = ctx.data::<AppContext>()?;
+
+        let res = entity::prelude::SshKey::delete_many()
+            .filter(entity::ssh_key::Column::Id.eq(key_id))
+            .filter(entity::ssh_key::Column::UserId.eq(claims.sub))
+            .exec(&app.db)
+            .await?;
+        Ok(res.rows_affected > 0)
+    }
+
     async fn login(
         &self,
         ctx: &Context<'_>,

@@ -900,3 +900,22 @@ impl ProjectCardObject {
         Ok(issue.map(IssueObject::from))
     }
 }
+
+#[derive(SimpleObject, Clone)]
+pub struct SshKeyObject {
+    pub id: Uuid,
+    pub title: String,
+    pub fingerprint: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<entity::ssh_key::Model> for SshKeyObject {
+    fn from(m: entity::ssh_key::Model) -> Self {
+        Self {
+            id: m.id,
+            title: m.title,
+            fingerprint: m.fingerprint,
+            created_at: m.created_at,
+        }
+    }
+}
