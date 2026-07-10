@@ -36,3 +36,12 @@ docker_socket_path = "/var/run/docker.sock"
 # `${{ secrets.NAME }}`; if unset, secret-related features error out.
 # Env: SECRETS_ENCRYPTION_KEY
 secrets_encryption_key = "change-me-32-bytes-base64-encoded=="
+
+# Optional. If set, an admin user and a personal access token hashing to
+# this value are provisioned on first startup (idempotent), so
+# `Authorization: token <this value>` authenticates as admin immediately --
+# no `register`/`login` mutation ever required. Intended for API-only
+# deployments with no interactive/web usage. Generate one with:
+#   openssl rand -hex 32
+# Env: ADMIN_BOOTSTRAP_TOKEN
+# admin_bootstrap_token = "change-me"

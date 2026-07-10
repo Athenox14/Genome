@@ -89,6 +89,7 @@ export JWT_SECRET="change-me"
 export REPOS_ROOT_PATH="./data/repos"
 export DATA_DIR="./data/hiqlite"
 export SECRETS_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+export ADMIN_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)"
 cargo run -p server
 ```
 
@@ -96,6 +97,12 @@ The server runs migrations automatically on startup, storing its data under
 `DATA_DIR`. See `config/genome.example.toml` for the full list of
 environment variables (`LISTEN_ADDR`, `SSH_LISTEN_ADDR`,
 `PACKAGES_ROOT_PATH`, `FRONTEND_URL`, `DOCKER_SOCKET_PATH`, ...).
+
+For pure API/automation deployments (no interactive login at all), set
+`ADMIN_BOOTSTRAP_TOKEN`: on first startup this provisions an admin user and a
+matching personal access token, so `Authorization: token <that value>` works
+against `/graphql` immediately, with no `register`/`login` mutation ever
+required. Idempotent — safe to leave set across restarts.
 
 To also run the frontend: `cd frontend && npm install && npm run dev`
 (defaults to pointing at `http://localhost:8000`).

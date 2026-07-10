@@ -40,6 +40,13 @@ pub struct Config {
     /// `{packages_root_path}/{owner}/{name}/{version}/{filename}`. Defaults
     /// to a `packages` directory alongside `repos_root_path`.
     pub packages_root_path: String,
+    /// Optional bootstrap credential for pure API/automation use: if set, an
+    /// admin user + a personal access token hashing to this value are
+    /// created on first startup (idempotent -- skipped if a token with this
+    /// hash already exists), so `Authorization: token <this value>` works
+    /// immediately with no `register`/`login` step ever required. Intended
+    /// for deployments with no interactive/web usage at all.
+    pub admin_bootstrap_token: Option<String>,
 }
 
 impl Config {
@@ -82,6 +89,8 @@ impl Config {
                 .to_string()
         });
 
+        let admin_bootstrap_token = std::env::var("ADMIN_BOOTSTRAP_TOKEN").ok();
+
         Ok(Config {
             data_dir,
             hiqlite_api_addr,
@@ -95,6 +104,7 @@ impl Config {
             ssh_host_key_path,
             frontend_url,
             packages_root_path,
+            admin_bootstrap_token,
         })
     }
 }

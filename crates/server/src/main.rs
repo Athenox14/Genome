@@ -145,6 +145,10 @@ async fn main() -> anyhow::Result<()> {
     let db: hiqlite::Client = hiqlite::start_node(node_config).await?;
     db.migrate::<migration::Migrations>().await?;
 
+    if let Some(bootstrap_token) = &config.admin_bootstrap_token {
+        bootstrap_admin_token(&db, bootstrap_token).await?;
+    }
+
     let repo_manager = Arc::new(git_core::RepoManager::new(config.repos_root_path.clone()));
     let artifacts_root = std::path::Path::new(&config.repos_root_path)
         .parent()
@@ -997,6 +1001,81 @@ fn hiqlite_secret(seed: &str, purpose: &str) -> String {
         secret.push('0');
     }
     secret
+}
+
+/// Idempotently ensures an admin user + a personal access token hashing to
+/// `bootstrap_token` both exist, so `Authorization: token <bootstrap_token>`
+/// authenticates as an admin immediately on every startup with no
+/// `register`/`login` step ever required -- the intended bootstrap path for
+/// deployments that are pure API/automation with no interactive use.
+async fn bootstrap_admin_token(db: &hiqlite::Client, bootstrap_token: &str) -> anyhow::Result<()> {
+    let token_hash = auth::hash_token(bootstrap_token);
+
+    let existing = db
+        .query_as::<entity::access_token::Model, _>(
+            "SELECT * FROM access_tokens WHERE token_hash = ?1",
+            params!(token_hash.clone()),
+        )
+        .await?;
+    if !existing.is_empty() {
+        tracing::info!("admin bootstrap token already provisioned, skipping");
+        return Ok(());
+    }
+
+    const BOOTSTRAP_USERNAME: &str = "admin";
+    let admin_user = db
+        .query_as::<entity::user::Model, _>(
+            "SELECT * FROM users WHERE username = ?1",
+            params!(BOOTSTRAP_USERNAME.to_string()),
+        )
+        .await?
+        .into_iter()
+        .next();
+
+    let admin_user_id = match admin_user {
+        Some(u) => u.id,
+        None => {
+            let id = Uuid::new_v4();
+            // No one is ever meant to log in as this account with a
+            // password -- it exists solely to own the bootstrap PAT -- so
+            // its password hash is a random, never-recorded value.
+            let random_unusable_password = Uuid::new_v4().to_string();
+            let password_hash = auth::hash_password(&random_unusable_password)
+                .map_err(|e| anyhow::anyhow!("failed to hash bootstrap admin password: {e}"))?;
+            db.execute(
+                "INSERT INTO users (id, username, email, password_hash, is_admin, avatar_url, created_at, totp_secret, totp_enabled, deactivated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, ?7, NULL)",
+                params!(
+                    id.to_string(),
+                    BOOTSTRAP_USERNAME.to_string(),
+                    "admin@localhost".to_string(),
+                    password_hash,
+                    1i64,
+                    chrono::Utc::now().to_rfc3339(),
+                    0i64
+                ),
+            )
+            .await?;
+            tracing::info!("created bootstrap admin user '{BOOTSTRAP_USERNAME}'");
+            id
+        }
+    };
+
+    db.execute(
+        "INSERT INTO access_tokens (id, user_id, token_hash, name, scopes, expires_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+        params!(
+            Uuid::new_v4().to_string(),
+            admin_user_id.to_string(),
+            token_hash,
+            "bootstrap-admin-token".to_string(),
+            "[]".to_string()
+        ),
+    )
+    .await?;
+    tracing::info!("provisioned admin bootstrap access token");
+
+    Ok(())
 }
 
 /// Loads and decrypts all Actions secrets for a repository, for injection
