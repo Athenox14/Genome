@@ -40,26 +40,44 @@ struct DbTokenLookup {
 #[async_trait::async_trait]
 impl auth::TokenLookup for DbTokenLookup {
     async fn lookup(&self, token_hash: &str) -> Option<auth::Claims> {
-        let token = entity::prelude::AccessToken::find()
+        if let Some(token) = entity::prelude::AccessToken::find()
             .filter(entity::access_token::Column::TokenHash.eq(token_hash))
             .one(&self.db)
             .await
-            .ok()??;
-
-        if let Some(expires_at) = token.expires_at {
-            if expires_at < chrono::Utc::now() {
-                return None;
+            .ok()
+            .flatten()
+        {
+            if let Some(expires_at) = token.expires_at {
+                if expires_at < chrono::Utc::now() {
+                    return None;
+                }
             }
+            return self.claims_for_user(token.user_id).await;
         }
 
-        let user = entity::prelude::User::find_by_id(token.user_id)
+        // Fall back to OAuth2-issued access tokens (same token_hash-keyed
+        // lookup, distinct table/expiry semantics: OAuth2 tokens always
+        // expire, no optional-expiry branch needed).
+        let oauth_token = entity::prelude::Oauth2AccessToken::find_by_id(token_hash.to_string())
+            .one(&self.db)
+            .await
+            .ok()??;
+        if oauth_token.expires_at < chrono::Utc::now() {
+            return None;
+        }
+        self.claims_for_user(oauth_token.user_id).await
+    }
+}
+
+impl DbTokenLookup {
+    async fn claims_for_user(&self, user_id: Uuid) -> Option<auth::Claims> {
+        let user = entity::prelude::User::find_by_id(user_id)
             .one(&self.db)
             .await
             .ok()??;
         if user.deactivated_at.is_some() {
             return None;
         }
-
         Some(auth::Claims {
             sub: user.id,
             username: user.username,
