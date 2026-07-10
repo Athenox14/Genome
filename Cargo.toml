@@ -10,6 +10,7 @@ members = [
     "crates/dev-env",
     "crates/webhooks",
     "crates/server",
+    "crates/ssh-server",
 ]
 
 [workspace.package]
@@ -42,3 +43,6 @@ futures-util = "0.3"
 tar = "0.4"
 regex = "1"
 dashmap = "6"
+aes-gcm = "0.10"
+base64 = "0.22"
+rand = "0.8"

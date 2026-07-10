@@ -13,6 +13,7 @@ actions = { path = "../actions" }
 dev-env = { path = "../dev-env" }
 graphql-api = { path = "../graphql-api" }
 webhooks = { path = "../webhooks" }
+ssh-server = { path = "../ssh-server" }
 
 axum = { workspace = true }
 tokio = { workspace = true }

@@ -1,6 +1,6 @@
 use async_graphql::{ComplexObject, Context, SimpleObject};
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use uuid::Uuid;
 
 use crate::context::AppContext;
@@ -136,6 +136,17 @@ impl RepositoryObject {
         Ok(runs.into_iter().map(WorkflowRunObject::from).collect())
     }
 
+    /// Names of the Actions secrets configured for this repository. Values
+    /// are never exposed via GraphQL (write-only, standard practice).
+    async fn secret_names(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<String>> {
+        let app = ctx.data::<AppContext>()?;
+        let secrets = entity::prelude::RepoSecret::find()
+            .filter(entity::repo_secret::Column::RepoId.eq(self.id))
+            .all(&app.db)
+            .await?;
+        Ok(secrets.into_iter().map(|s| s.name).collect())
+    }
+
     async fn branches(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<BranchObject>> {
         let app = ctx.data::<AppContext>()?;
         let names = app
@@ -159,6 +170,25 @@ impl RepositoryObject {
         Ok(entries.into_iter().map(TreeEntryObject::from).collect())
     }
 
+    /// Names of the Markdown pages present in this repository's wiki.
+    async fn wiki_pages(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<String>> {
+        let app = ctx.data::<AppContext>()?;
+        let pages = app
+            .repo_manager
+            .wiki_list_pages(&self.owner_login, &self.name)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(pages)
+    }
+
+    /// The Markdown content of a single wiki page, or `null` if it doesn't exist.
+    async fn wiki_page(&self, ctx: &Context<'_>, page: String) -> async_graphql::Result<Option<String>> {
+        let app = ctx.data::<AppContext>()?;
+        match app.repo_manager.wiki_read_page(&self.owner_login, &self.name, &page) {
+            Ok(content) => Ok(Some(content)),
+            Err(_) => Ok(None),
+        }
+    }
+
     async fn commits(
         &self,
         ctx: &Context<'_>,
@@ -171,6 +201,35 @@ impl RepositoryObject {
             .commit_log(&self.owner_login, &self.name, &r#ref, limit.max(0) as usize)
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(commits.into_iter().map(CommitObject::from).collect())
+    }
+
+    /// Branch protection rules configured for this repository.
+    async fn branch_protection_rules(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Vec<BranchProtectionRuleObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let rules = entity::prelude::BranchProtectionRule::find()
+            .filter(entity::branch_protection_rule::Column::RepoId.eq(self.id))
+            .all(&app.db)
+            .await?;
+        Ok(rules.into_iter().map(BranchProtectionRuleObject::from).collect())
+    }
+
+    /// Recent activity events (pushes, issues, PRs, merges) for this repository.
+    async fn activity(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 20)] limit: i32,
+    ) -> async_graphql::Result<Vec<ActivityEventObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let events = entity::prelude::ActivityEvent::find()
+            .filter(entity::activity_event::Column::RepoId.eq(self.id))
+            .order_by_desc(entity::activity_event::Column::CreatedAt)
+            .limit(limit.max(0) as u64)
+            .all(&app.db)
+            .await?;
+        Ok(events.into_iter().map(ActivityEventObject::from).collect())
     }
 }
 
@@ -313,6 +372,8 @@ pub struct DevWorkspaceObject {
     pub status: String,
     pub container_id: Option<String>,
     pub created_at: DateTime<Utc>,
+    pub auto_stop_minutes: Option<i32>,
+    pub last_activity_at: Option<DateTime<Utc>>,
 }
 
 impl From<entity::dev_workspace::Model> for DevWorkspaceObject {
@@ -326,6 +387,8 @@ impl From<entity::dev_workspace::Model> for DevWorkspaceObject {
             status: m.status,
             container_id: m.container_id,
             created_at: m.created_at,
+            auto_stop_minutes: m.auto_stop_minutes,
+            last_activity_at: m.last_activity_at,
         }
     }
 }
@@ -381,4 +444,260 @@ impl From<git_core::TreeEntry> for TreeEntryObject {
 pub struct AuthPayload {
     pub token: String,
     pub user: UserObject,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct NotificationObject {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub kind: String,
+    pub repo_id: Uuid,
+    pub subject_id: Uuid,
+    pub message: String,
+    pub read_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<entity::notification::Model> for NotificationObject {
+    fn from(m: entity::notification::Model) -> Self {
+        Self {
+            id: m.id,
+            user_id: m.user_id,
+            kind: m.kind,
+            repo_id: m.repo_id,
+            subject_id: m.subject_id,
+            message: m.message,
+            read_at: m.read_at,
+            created_at: m.created_at,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ActivityEventObject {
+    pub id: Uuid,
+    pub repo_id: Option<Uuid>,
+    pub actor_id: Uuid,
+    pub kind: String,
+    pub summary: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<entity::activity_event::Model> for ActivityEventObject {
+    fn from(m: entity::activity_event::Model) -> Self {
+        Self {
+            id: m.id,
+            repo_id: m.repo_id,
+            actor_id: m.actor_id,
+            kind: m.kind,
+            summary: m.summary,
+            created_at: m.created_at,
+        }
+    }
+}
+
+/// Result bundle for the basic `search` query, grouping matches by entity kind.
+#[derive(SimpleObject, Clone)]
+pub struct SearchResults {
+    pub repositories: Vec<RepositoryObject>,
+    pub issues: Vec<IssueObject>,
+    pub users: Vec<UserObject>,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct BranchProtectionRuleObject {
+    pub id: Uuid,
+    pub repo_id: Uuid,
+    pub branch_pattern: String,
+    pub require_reviews_count: i32,
+    pub require_status_checks: bool,
+    pub block_force_push: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<entity::branch_protection_rule::Model> for BranchProtectionRuleObject {
+    fn from(m: entity::branch_protection_rule::Model) -> Self {
+        Self {
+            id: m.id,
+            repo_id: m.repo_id,
+            branch_pattern: m.branch_pattern,
+            require_reviews_count: m.require_reviews_count,
+            require_status_checks: m.require_status_checks,
+            block_force_push: m.block_force_push,
+            created_at: m.created_at,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone)]
+#[graphql(complex)]
+pub struct PrReviewObject {
+    pub id: Uuid,
+    pub pr_id: Uuid,
+    pub reviewer_id: Uuid,
+    pub state: String,
+    pub body: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<entity::pr_review::Model> for PrReviewObject {
+    fn from(m: entity::pr_review::Model) -> Self {
+        Self {
+            id: m.id,
+            pr_id: m.pr_id,
+            reviewer_id: m.reviewer_id,
+            state: m.state,
+            body: m.body,
+            created_at: m.created_at,
+        }
+    }
+}
+
+#[ComplexObject]
+impl PrReviewObject {
+    /// Inline comments left on specific lines of the diff as part of this review.
+    async fn comments(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<PrReviewCommentObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let comments = entity::prelude::PrReviewComment::find()
+            .filter(entity::pr_review_comment::Column::ReviewId.eq(self.id))
+            .order_by_asc(entity::pr_review_comment::Column::CreatedAt)
+            .all(&app.db)
+            .await?;
+        Ok(comments.into_iter().map(PrReviewCommentObject::from).collect())
+    }
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct PrReviewCommentObject {
+    pub id: Uuid,
+    pub review_id: Uuid,
+    pub file_path: String,
+    pub line_number: i32,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<entity::pr_review_comment::Model> for PrReviewCommentObject {
+    fn from(m: entity::pr_review_comment::Model) -> Self {
+        Self {
+            id: m.id,
+            review_id: m.review_id,
+            file_path: m.file_path,
+            line_number: m.line_number,
+            body: m.body,
+            created_at: m.created_at,
+        }
+    }
+}
+
+/// Returned by `enableTwoFactor`: the frontend renders `provisioning_uri` as
+/// a QR code (or shows `secret` for manual entry), then the user confirms
+/// with a code via `confirmTwoFactor`.
+#[derive(SimpleObject, Clone)]
+pub struct TwoFactorSetup {
+    pub secret: String,
+    pub provisioning_uri: String,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct LabelObject {
+    pub id: Uuid,
+    pub repo_id: Uuid,
+    pub name: String,
+    pub color: String,
+}
+
+impl From<entity::label::Model> for LabelObject {
+    fn from(m: entity::label::Model) -> Self {
+        Self {
+            id: m.id,
+            repo_id: m.repo_id,
+            name: m.name,
+            color: m.color,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct MilestoneObject {
+    pub id: Uuid,
+    pub repo_id: Uuid,
+    pub title: String,
+    pub description: Option<String>,
+    pub due_date: Option<DateTime<Utc>>,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<entity::milestone::Model> for MilestoneObject {
+    fn from(m: entity::milestone::Model) -> Self {
+        Self {
+            id: m.id,
+            repo_id: m.repo_id,
+            title: m.title,
+            description: m.description,
+            due_date: m.due_date,
+            state: m.state,
+            created_at: m.created_at,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ProjectObject {
+    pub id: Uuid,
+    pub repo_id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<entity::project::Model> for ProjectObject {
+    fn from(m: entity::project::Model) -> Self {
+        Self {
+            id: m.id,
+            repo_id: m.repo_id,
+            name: m.name,
+            created_at: m.created_at,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ProjectColumnObject {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub name: String,
+    pub position: i32,
+}
+
+impl From<entity::project_column::Model> for ProjectColumnObject {
+    fn from(m: entity::project_column::Model) -> Self {
+        Self {
+            id: m.id,
+            project_id: m.project_id,
+            name: m.name,
+            position: m.position,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ProjectCardObject {
+    pub id: Uuid,
+    pub column_id: Uuid,
+    pub issue_id: Option<Uuid>,
+    pub pull_request_id: Option<Uuid>,
+    pub position: i32,
+}
+
+impl From<entity::project_card::Model> for ProjectCardObject {
+    fn from(m: entity::project_card::Model) -> Self {
+        Self {
+            id: m.id,
+            column_id: m.column_id,
+            issue_id: m.issue_id,
+            pull_request_id: m.pull_request_id,
+            position: m.position,
+        }
+    }
 }

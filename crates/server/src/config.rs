@@ -8,6 +8,19 @@ pub struct Config {
     pub repos_root_path: String,
     pub listen_addr: String,
     pub docker_socket_path: String,
+    /// 32 raw bytes, base64-encoded, used to encrypt/decrypt Actions
+    /// secrets at rest (AES-256-GCM). Optional: features that need it
+    /// (setting/using repo secrets) will error out if it's unset.
+    pub secrets_encryption_key: Option<String>,
+    /// Address the git-over-SSH server listens on.
+    ///
+    /// Defaults to port 2222 rather than the standard port 22, since
+    /// binding 22 usually requires root/administrator privileges. To serve
+    /// on 22 either run this process with elevated privileges or forward
+    /// port 22 to this listener at the network layer.
+    pub ssh_listen_addr: String,
+    /// Path to the persisted SSH host key (generated on first run).
+    pub ssh_host_key_path: String,
 }
 
 impl Config {
@@ -29,12 +42,22 @@ impl Config {
         let docker_socket_path =
             std::env::var("DOCKER_SOCKET_PATH").unwrap_or(default_docker_socket);
 
+        let secrets_encryption_key = std::env::var("SECRETS_ENCRYPTION_KEY").ok();
+
+        let ssh_listen_addr =
+            std::env::var("SSH_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:2222".to_string());
+        let ssh_host_key_path = std::env::var("SSH_HOST_KEY_PATH")
+            .unwrap_or_else(|_| "./data/ssh_host_key".to_string());
+
         Ok(Config {
             database_url,
             jwt_secret,
             repos_root_path,
             listen_addr,
             docker_socket_path,
+            secrets_encryption_key,
+            ssh_listen_addr,
+            ssh_host_key_path,
         })
     }
 }

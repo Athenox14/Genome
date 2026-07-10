@@ -43,6 +43,144 @@ impl RepoManager {
         Ok(path)
     }
 
+    /// Compute the filesystem path for a repository's wiki (a second bare
+    /// repo, named `{name}.wiki.git`, mirroring Forgejo's wiki model).
+    pub fn wiki_repo_path(&self, owner: &str, name: &str) -> PathBuf {
+        // Best-effort slug validation; callers are expected to have already
+        // validated owner/name via `repo_path`/`init_repo` on the main repo.
+        self.root.join(owner).join(format!("{name}.wiki.git"))
+    }
+
+    /// Initialize a new bare wiki repository at `{root}/{owner}/{name}.wiki.git`.
+    pub fn init_wiki(&self, owner: &str, name: &str) -> Result<PathBuf> {
+        validate_slug(owner)?;
+        validate_slug(name)?;
+        let path = self.wiki_repo_path(owner, name);
+        if path.exists() {
+            return Err(GitCoreError::RepoAlreadyExists(path));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Repository::init_bare(&path)?;
+        Ok(path)
+    }
+
+    fn open_wiki(&self, owner: &str, name: &str) -> Result<(Repository, PathBuf)> {
+        validate_slug(owner)?;
+        validate_slug(name)?;
+        let path = self.wiki_repo_path(owner, name);
+        if !path.exists() {
+            return Err(GitCoreError::RepoNotFound(path));
+        }
+        let repo = Repository::open_bare(&path)?;
+        Ok((repo, path))
+    }
+
+    /// List the `.md` page names (without extension) present at HEAD of the
+    /// wiki repository's default branch.
+    pub fn wiki_list_pages(&self, owner: &str, name: &str) -> Result<Vec<String>> {
+        let (repo, _) = self.open_wiki(owner, name)?;
+        let head = match repo.head() {
+            Ok(head) => head,
+            Err(_) => return Ok(Vec::new()), // unborn repo: no pages yet
+        };
+        let commit = head
+            .peel_to_commit()
+            .map_err(|_| GitCoreError::NoDefaultBranch)?;
+        let tree = commit.tree()?;
+
+        let mut out = Vec::new();
+        for entry in tree.iter() {
+            if entry.kind() != Some(ObjectType::Blob) {
+                continue;
+            }
+            let entry_name = entry.name().unwrap_or_default();
+            if let Some(page) = entry_name.strip_suffix(".md") {
+                out.push(page.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read the content of `{page}.md` at HEAD of the wiki repository as a
+    /// UTF-8 string.
+    pub fn wiki_read_page(&self, owner: &str, name: &str, page: &str) -> Result<String> {
+        let (repo, _) = self.open_wiki(owner, name)?;
+        let head = repo.head().map_err(|_| {
+            GitCoreError::PathNotFound(format!("{page}.md"))
+        })?;
+        let commit = head
+            .peel_to_commit()
+            .map_err(|_| GitCoreError::PathNotFound(format!("{page}.md")))?;
+        let tree = commit.tree()?;
+        let file_path = format!("{page}.md");
+        let entry = tree
+            .get_path(Path::new(&file_path))
+            .map_err(|_| GitCoreError::PathNotFound(file_path.clone()))?;
+        let object = entry.to_object(&repo)?;
+        let blob = object
+            .as_blob()
+            .ok_or_else(|| GitCoreError::NotAFile(file_path.clone()))?;
+        Ok(String::from_utf8(blob.content().to_vec())?)
+    }
+
+    /// Create or update `{page}.md` in the wiki repository, committing the
+    /// change on the default branch (creating it, as "master", if the repo
+    /// is unborn). Returns the new commit's sha.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wiki_write_page(
+        &self,
+        owner: &str,
+        name: &str,
+        page: &str,
+        content: &str,
+        author_name: &str,
+        author_email: &str,
+        message: &str,
+    ) -> Result<String> {
+        let (repo, _) = self.open_wiki(owner, name)?;
+        const WIKI_DEFAULT_BRANCH: &str = "master";
+        let ref_name = format!("refs/heads/{WIKI_DEFAULT_BRANCH}");
+
+        let (parent_commit, base_tree) = match repo.head() {
+            Ok(head) => {
+                let commit = head.peel_to_commit()?;
+                let tree = commit.tree()?;
+                (Some(commit), Some(tree))
+            }
+            Err(_) => (None, None),
+        };
+
+        let blob_oid = repo.blob(content.as_bytes())?;
+
+        let mut builder = repo.treebuilder(base_tree.as_ref())?;
+        let file_name = format!("{page}.md");
+        builder.insert(&file_name, blob_oid, 0o100644)?;
+        let tree_oid = builder.write()?;
+        let tree = repo.find_tree(tree_oid)?;
+
+        let signature = git2::Signature::now(author_name, author_email)?;
+
+        let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
+        let commit_oid = repo.commit(
+            Some(&ref_name),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        )?;
+
+        // If the repo was unborn (no HEAD ref existed), point HEAD at the
+        // newly created branch.
+        if repo.head().is_err() {
+            repo.set_head(&ref_name)?;
+        }
+
+        Ok(commit_oid.to_string())
+    }
+
     /// Permanently delete a repository from disk.
     pub fn delete_repo(&self, owner: &str, name: &str) -> Result<()> {
         let path = self.repo_path(owner, name)?;
@@ -60,6 +198,28 @@ impl RepoManager {
         }
         let repo = Repository::open_bare(&path)?;
         Ok((repo, path))
+    }
+
+    /// Determine whether `ancestor_sha` is an ancestor of (or equal to)
+    /// `descendant_sha`. Used to detect non-fast-forward ("force") pushes: a
+    /// push that moves a branch ref to a commit that is *not* a descendant
+    /// of the previous tip is a force push (history was rewritten).
+    pub fn is_ancestor(
+        &self,
+        owner: &str,
+        name: &str,
+        ancestor_sha: &str,
+        descendant_sha: &str,
+    ) -> Result<bool> {
+        let (repo, _) = self.open(owner, name)?;
+        let ancestor_oid = git2::Oid::from_str(ancestor_sha)
+            .map_err(|_| GitCoreError::RefNotFound(ancestor_sha.to_string()))?;
+        let descendant_oid = git2::Oid::from_str(descendant_sha)
+            .map_err(|_| GitCoreError::RefNotFound(descendant_sha.to_string()))?;
+        if ancestor_oid == descendant_oid {
+            return Ok(true);
+        }
+        Ok(repo.graph_descendant_of(descendant_oid, ancestor_oid)?)
     }
 
     /// List local branch names for a repository.
@@ -602,5 +762,59 @@ mod tests {
             .find_reference("refs/heads/main")
             .expect("find main ref");
         assert_eq!(main_ref.target().expect("target"), merge_commit.id());
+    }
+
+    #[test]
+    fn wiki_write_read_and_update_page() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = RepoManager::new(dir.path());
+        manager.init_repo("acme", "widgets").expect("init repo");
+        manager.init_wiki("acme", "widgets").expect("init wiki");
+
+        let sha1 = manager
+            .wiki_write_page(
+                "acme",
+                "widgets",
+                "Home",
+                "# Hello\n",
+                "Test",
+                "test@example.com",
+                "create Home page",
+            )
+            .expect("write page");
+        assert!(!sha1.is_empty());
+
+        let pages = manager
+            .wiki_list_pages("acme", "widgets")
+            .expect("list pages");
+        assert_eq!(pages, vec!["Home".to_string()]);
+
+        let content = manager
+            .wiki_read_page("acme", "widgets", "Home")
+            .expect("read page");
+        assert_eq!(content, "# Hello\n");
+
+        let sha2 = manager
+            .wiki_write_page(
+                "acme",
+                "widgets",
+                "Home",
+                "# Hello again\n",
+                "Test",
+                "test@example.com",
+                "update Home page",
+            )
+            .expect("update page");
+        assert_ne!(sha1, sha2);
+
+        let content2 = manager
+            .wiki_read_page("acme", "widgets", "Home")
+            .expect("read updated page");
+        assert_eq!(content2, "# Hello again\n");
+
+        let pages2 = manager
+            .wiki_list_pages("acme", "widgets")
+            .expect("list pages again");
+        assert_eq!(pages2, vec!["Home".to_string()]);
     }
 }

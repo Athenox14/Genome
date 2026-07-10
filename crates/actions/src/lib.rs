@@ -30,10 +30,12 @@
 use std::collections::HashMap;
 
 pub mod executor;
+pub mod secrets;
 pub mod trigger;
 pub mod workflow;
 
 pub use executor::{Executor, JobResult, JobStatus};
+pub use secrets::{decrypt_secret, encrypt_secret, key_from_base64, substitute_secrets};
 pub use trigger::matches_event;
 pub use workflow::{Job, Step, TriggerConfig, Workflow};
 

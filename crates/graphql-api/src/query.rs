@@ -1,9 +1,15 @@
 use async_graphql::{Context, Object};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{
+    sea_query::extension::postgres::PgExpr, sea_query::Expr, ColumnTrait, Condition, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+};
 use uuid::Uuid;
 
 use crate::context::{AppContext, RequestContext};
-use crate::types::{DevWorkspaceObject, OrganizationObject, RepositoryObject, UserObject};
+use crate::types::{
+    ActivityEventObject, DevWorkspaceObject, IssueObject, NotificationObject, OrganizationObject,
+    RepositoryObject, SearchResults, UserObject,
+};
 
 pub struct QueryRoot;
 
@@ -148,5 +154,222 @@ impl QueryRoot {
             .all(&app.db)
             .await?;
         Ok(workspaces.into_iter().map(DevWorkspaceObject::from).collect())
+    }
+
+    /// Lists all users on the instance, paginated. Restricted to site admins.
+    async fn admin_list_users(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 50)] limit: u64,
+        #[graphql(default = 0)] offset: u64,
+    ) -> async_graphql::Result<Vec<UserObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let Some(claims) = &req.user else {
+            return Err(async_graphql::Error::new("unauthenticated"));
+        };
+        if !claims.is_admin {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let users = entity::prelude::User::find()
+            .order_by_asc(entity::user::Column::CreatedAt)
+            .paginate(&app.db, limit.max(1))
+            .fetch_page(offset / limit.max(1))
+            .await?;
+        Ok(users.into_iter().map(UserObject::from).collect())
+    }
+
+    /// Notifications addressed to the current user, most recent first.
+    async fn my_notifications(
+        &self,
+        ctx: &Context<'_>,
+        unread_only: Option<bool>,
+    ) -> async_graphql::Result<Vec<NotificationObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let Some(claims) = &req.user else {
+            return Err(async_graphql::Error::new("unauthenticated"));
+        };
+
+        let mut query = entity::prelude::Notification::find()
+            .filter(entity::notification::Column::UserId.eq(claims.sub));
+        if unread_only.unwrap_or(false) {
+            query = query.filter(entity::notification::Column::ReadAt.is_null());
+        }
+
+        let notifications = query
+            .order_by_desc(entity::notification::Column::CreatedAt)
+            .all(&app.db)
+            .await?;
+        Ok(notifications.into_iter().map(NotificationObject::from).collect())
+    }
+
+    /// Recent activity across every repository the current user can see
+    /// (owned, collaborated on, or public).
+    async fn my_activity(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 20)] limit: i32,
+    ) -> async_graphql::Result<Vec<ActivityEventObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let Some(claims) = &req.user else {
+            return Err(async_graphql::Error::new("unauthenticated"));
+        };
+
+        let owned_ids: Vec<Uuid> = entity::prelude::Repository::find()
+            .filter(entity::repository::Column::OwnerType.eq("user"))
+            .filter(entity::repository::Column::OwnerId.eq(claims.sub))
+            .all(&app.db)
+            .await?
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+
+        let collab_ids: Vec<Uuid> = entity::prelude::RepoCollaborator::find()
+            .filter(entity::repo_collaborator::Column::UserId.eq(claims.sub))
+            .all(&app.db)
+            .await?
+            .into_iter()
+            .map(|c| c.repo_id)
+            .collect();
+
+        let public_ids: Vec<Uuid> = entity::prelude::Repository::find()
+            .filter(entity::repository::Column::IsPrivate.eq(false))
+            .all(&app.db)
+            .await?
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+
+        let mut visible_ids = owned_ids;
+        visible_ids.extend(collab_ids);
+        visible_ids.extend(public_ids);
+        visible_ids.sort();
+        visible_ids.dedup();
+
+        if visible_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let events = entity::prelude::ActivityEvent::find()
+            .filter(entity::activity_event::Column::RepoId.is_in(visible_ids))
+            .order_by_desc(entity::activity_event::Column::CreatedAt)
+            .limit(limit.max(0) as u64)
+            .all(&app.db)
+            .await?;
+        Ok(events.into_iter().map(ActivityEventObject::from).collect())
+    }
+
+    /// Basic ILIKE-based search across repositories, issues, and users.
+    /// Each result list is capped at 20 entries.
+    async fn search(&self, ctx: &Context<'_>, query: String) -> async_graphql::Result<SearchResults> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let pattern = format!("%{}%", query);
+
+        // Repositories: public ones, plus ones the current user owns or collaborates on.
+        let mut repo_condition = Condition::any().add(entity::repository::Column::IsPrivate.eq(false));
+        if let Some(claims) = &req.user {
+            let owned_or_collab_ids: Vec<Uuid> = {
+                let mut ids: Vec<Uuid> = entity::prelude::Repository::find()
+                    .filter(entity::repository::Column::OwnerType.eq("user"))
+                    .filter(entity::repository::Column::OwnerId.eq(claims.sub))
+                    .all(&app.db)
+                    .await?
+                    .into_iter()
+                    .map(|r| r.id)
+                    .collect();
+                ids.extend(
+                    entity::prelude::RepoCollaborator::find()
+                        .filter(entity::repo_collaborator::Column::UserId.eq(claims.sub))
+                        .all(&app.db)
+                        .await?
+                        .into_iter()
+                        .map(|c| c.repo_id),
+                );
+                ids
+            };
+            if !owned_or_collab_ids.is_empty() {
+                repo_condition = repo_condition.add(entity::repository::Column::Id.is_in(owned_or_collab_ids));
+            }
+        }
+
+        let repos = entity::prelude::Repository::find()
+            .filter(repo_condition)
+            .filter(
+                Condition::any()
+                    .add(Expr::col(entity::repository::Column::Name).like(&pattern))
+                    .add(Expr::col(entity::repository::Column::Description).like(&pattern)),
+            )
+            .limit(20)
+            .all(&app.db)
+            .await?;
+        let mut repositories = Vec::with_capacity(repos.len());
+        for r in repos {
+            repositories.push(RepositoryObject::from_model(&app.db, r).await);
+        }
+
+        // Issues: only from repos visible to the current search context (public,
+        // or owned/collaborated-on by the current user).
+        let visible_repo_ids: Vec<Uuid> = {
+            let mut cond = Condition::any().add(entity::repository::Column::IsPrivate.eq(false));
+            if let Some(claims) = &req.user {
+                let mut ids: Vec<Uuid> = entity::prelude::Repository::find()
+                    .filter(entity::repository::Column::OwnerType.eq("user"))
+                    .filter(entity::repository::Column::OwnerId.eq(claims.sub))
+                    .all(&app.db)
+                    .await?
+                    .into_iter()
+                    .map(|r| r.id)
+                    .collect();
+                ids.extend(
+                    entity::prelude::RepoCollaborator::find()
+                        .filter(entity::repo_collaborator::Column::UserId.eq(claims.sub))
+                        .all(&app.db)
+                        .await?
+                        .into_iter()
+                        .map(|c| c.repo_id),
+                );
+                if !ids.is_empty() {
+                    cond = cond.add(entity::repository::Column::Id.is_in(ids));
+                }
+            }
+            entity::prelude::Repository::find()
+                .filter(cond)
+                .all(&app.db)
+                .await?
+                .into_iter()
+                .map(|r| r.id)
+                .collect()
+        };
+
+        let issues = if visible_repo_ids.is_empty() {
+            vec![]
+        } else {
+            entity::prelude::Issue::find()
+                .filter(entity::issue::Column::RepoId.is_in(visible_repo_ids))
+                .filter(
+                    Condition::any()
+                        .add(Expr::col(entity::issue::Column::Title).like(&pattern))
+                        .add(Expr::col(entity::issue::Column::Body).like(&pattern)),
+                )
+                .limit(20)
+                .all(&app.db)
+                .await?
+        };
+
+        let users = entity::prelude::User::find()
+            .filter(Expr::col(entity::user::Column::Username).like(&pattern))
+            .limit(20)
+            .all(&app.db)
+            .await?;
+
+        Ok(SearchResults {
+            repositories,
+            issues: issues.into_iter().map(IssueObject::from).collect(),
+            users: users.into_iter().map(UserObject::from).collect(),
+        })
     }
 }

@@ -1,30 +1,29 @@
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, serde::Serialize, serde::Deserialize)]
-#[sea_orm(table_name = "dev_workspaces")]
+#[sea_orm(table_name = "notifications")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
-    pub owner_id: Uuid,
-    pub repo_id: Option<Uuid>,
-    pub name: String,
-    pub image: String,
-    #[sea_orm(default_value = "starting")]
-    pub status: String,
-    pub container_id: Option<String>,
+    pub user_id: Uuid,
+    pub kind: String,
+    pub repo_id: Uuid,
+    /// Polymorphic reference to the issue or pull request this notification
+    /// concerns. No FK constraint since it can point at either table.
+    pub subject_id: Uuid,
+    pub message: String,
+    pub read_at: Option<ChronoDateTimeUtc>,
     pub created_at: ChronoDateTimeUtc,
-    pub auto_stop_minutes: Option<i32>,
-    pub last_activity_at: Option<ChronoDateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
         belongs_to = "super::user::Entity",
-        from = "Column::OwnerId",
+        from = "Column::UserId",
         to = "super::user::Column::Id"
     )]
-    Owner,
+    User,
     #[sea_orm(
         belongs_to = "super::repository::Entity",
         from = "Column::RepoId",
@@ -35,7 +34,7 @@ pub enum Relation {
 
 impl Related<super::user::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Owner.def()
+        Relation::User.def()
     }
 }
 impl Related<super::repository::Entity> for Entity {
@@ -46,8 +45,9 @@ impl Related<super::repository::Entity> for Entity {
 
 impl ActiveModelBehavior for ActiveModel {}
 
-pub mod status {
-    pub const STARTING: &str = "starting";
-    pub const RUNNING: &str = "running";
-    pub const STOPPED: &str = "stopped";
+pub mod kind {
+    pub const ISSUE_COMMENT: &str = "issue_comment";
+    pub const PR_REVIEW: &str = "pr_review";
+    pub const MENTION: &str = "mention";
+    pub const PR_MERGED: &str = "pr_merged";
 }

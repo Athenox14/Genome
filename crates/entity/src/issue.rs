@@ -14,6 +14,7 @@ pub struct Model {
     pub state: String,
     pub created_at: ChronoDateTimeUtc,
     pub closed_at: Option<ChronoDateTimeUtc>,
+    pub milestone_id: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -34,6 +35,12 @@ pub enum Relation {
     IssueComment,
     #[sea_orm(has_many = "super::issue_label::Entity")]
     IssueLabel,
+    #[sea_orm(
+        belongs_to = "super::milestone::Entity",
+        from = "Column::MilestoneId",
+        to = "super::milestone::Column::Id"
+    )]
+    Milestone,
 }
 
 impl Related<super::repository::Entity> for Entity {
@@ -54,6 +61,11 @@ impl Related<super::issue_comment::Entity> for Entity {
 impl Related<super::issue_label::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::IssueLabel.def()
+    }
+}
+impl Related<super::milestone::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Milestone.def()
     }
 }
 

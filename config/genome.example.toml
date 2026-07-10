@@ -26,3 +26,11 @@ listen_addr = "0.0.0.0:8000"
 # spawn ephemeral containers (e.g. for CI actions or dev environments).
 # Env: DOCKER_SOCKET_PATH
 docker_socket_path = "/var/run/docker.sock"
+
+# 32 raw bytes, base64-encoded, used to encrypt/decrypt Actions secrets
+# (repo_secrets.encrypted_value) at rest via AES-256-GCM. Generate one with:
+#   openssl rand -base64 32
+# Required for `setRepoSecret` and for running workflows that use
+# `${{ secrets.NAME }}`; if unset, secret-related features error out.
+# Env: SECRETS_ENCRYPTION_KEY
+secrets_encryption_key = "change-me-32-bytes-base64-encoded=="

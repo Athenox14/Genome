@@ -68,6 +68,7 @@ impl Executor {
         job: &Job,
         workdir_repo_archive: &[u8],
         env_extra: HashMap<String, String>,
+        secrets: &HashMap<String, String>,
         log_sink: impl Fn(String) + Send + 'static,
     ) -> Result<JobResult, ActionsError> {
         let image = Self::image_for_runs_on(&job.runs_on);
@@ -181,6 +182,8 @@ impl Executor {
 
             let step_name = step.name.clone().unwrap_or_else(|| run.clone());
             log_sink(format!("[step] {step_name}"));
+
+            let run = crate::secrets::substitute_secrets(run, secrets);
 
             let shell = step.shell.clone().unwrap_or_else(|| "sh".to_string());
             let mut step_env: Vec<String> = env_vars.clone();

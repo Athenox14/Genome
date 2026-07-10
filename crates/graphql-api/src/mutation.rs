@@ -8,11 +8,63 @@ use uuid::Uuid;
 
 use crate::context::{AppContext, RequestContext};
 use crate::types::{
-    resolve_owner_login, AuthPayload, DevWorkspaceObject, IssueCommentObject, IssueObject,
-    OrganizationObject, PullRequestObject, RepositoryObject, UserObject, WorkflowRunObject,
+    resolve_owner_login, AuthPayload, BranchProtectionRuleObject, DevWorkspaceObject,
+    IssueCommentObject, IssueObject, LabelObject, MilestoneObject, NotificationObject,
+    OrganizationObject, PrReviewCommentObject, PrReviewObject, ProjectCardObject,
+    ProjectColumnObject, ProjectObject, PullRequestObject, RepositoryObject, TwoFactorSetup,
+    UserObject, WorkflowRunObject,
 };
 
+const TOTP_ISSUER: &str = "Genome";
+
 pub struct MutationRoot;
+
+/// Best-effort notification insert: logs and swallows any error so that a
+/// failure to notify never fails the mutation that triggered it.
+async fn notify(
+    app: &AppContext,
+    user_id: Uuid,
+    kind: &str,
+    repo_id: Uuid,
+    subject_id: Uuid,
+    message: String,
+) {
+    let notification = entity::notification::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        user_id: Set(user_id),
+        kind: Set(kind.to_string()),
+        repo_id: Set(repo_id),
+        subject_id: Set(subject_id),
+        message: Set(message),
+        read_at: Set(None),
+        created_at: Set(Utc::now()),
+    };
+    if let Err(e) = notification.insert(&app.db).await {
+        tracing::warn!("failed to insert notification: {e}");
+    }
+}
+
+/// Best-effort activity feed insert: logs and swallows any error so that a
+/// failure to record activity never fails the mutation that triggered it.
+async fn record_activity(
+    app: &AppContext,
+    repo_id: Option<Uuid>,
+    actor_id: Uuid,
+    kind: &str,
+    summary: String,
+) {
+    let event = entity::activity_event::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        repo_id: Set(repo_id),
+        actor_id: Set(actor_id),
+        kind: Set(kind.to_string()),
+        summary: Set(summary),
+        created_at: Set(Utc::now()),
+    };
+    if let Err(e) = event.insert(&app.db).await {
+        tracing::warn!("failed to insert activity event: {e}");
+    }
+}
 
 fn username_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -111,6 +163,41 @@ async fn find_repo(app: &AppContext, repo_id: Uuid) -> async_graphql::Result<ent
         .ok_or_else(|| async_graphql::Error::new("repository not found"))
 }
 
+/// Loads and decrypts the `SECRETS_ENCRYPTION_KEY` environment variable into
+/// a raw 32-byte key. Returns an error if unset or malformed.
+fn secrets_encryption_key() -> anyhow::Result<[u8; 32]> {
+    let encoded = std::env::var("SECRETS_ENCRYPTION_KEY")
+        .map_err(|_| anyhow::anyhow!("SECRETS_ENCRYPTION_KEY environment variable must be set"))?;
+    actions::key_from_base64(&encoded)
+}
+
+/// Loads all secrets for a repository, decrypting each value, for injection
+/// into a workflow job run. Best-effort: individual secrets that fail to
+/// decrypt are skipped with a warning rather than aborting the whole run.
+pub(crate) async fn load_repo_secrets(
+    app: &AppContext,
+    repo_id: Uuid,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let key = secrets_encryption_key()?;
+    let rows = entity::prelude::RepoSecret::find()
+        .filter(entity::repo_secret::Column::RepoId.eq(repo_id))
+        .all(&app.db)
+        .await?;
+
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        match actions::decrypt_secret(&key, &row.encrypted_value) {
+            Ok(value) => {
+                out.insert(row.name, value);
+            }
+            Err(e) => {
+                tracing::warn!("failed to decrypt secret {} for repo {repo_id}: {e}", row.name);
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[Object]
 impl MutationRoot {
     async fn register(
@@ -136,6 +223,9 @@ impl MutationRoot {
             is_admin: Set(false),
             avatar_url: Set(None),
             created_at: Set(Utc::now()),
+            totp_secret: Set(None),
+            totp_enabled: Set(false),
+            deactivated_at: Set(None),
         };
 
         let user = user.insert(&app.db).await?;
@@ -147,6 +237,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         username: String,
         password: String,
+        totp_code: Option<String>,
     ) -> async_graphql::Result<AuthPayload> {
         let app = ctx.data::<AppContext>()?;
         let user = entity::prelude::User::find()
@@ -155,10 +246,28 @@ impl MutationRoot {
             .await?
             .ok_or_else(|| async_graphql::Error::new("invalid username or password"))?;
 
+        if user.deactivated_at.is_some() {
+            return Err(async_graphql::Error::new("account deactivated"));
+        }
+
         let valid = auth::verify_password(&password, &user.password_hash)
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         if !valid {
             return Err(async_graphql::Error::new("invalid username or password"));
+        }
+
+        if user.totp_enabled {
+            let secret = user
+                .totp_secret
+                .as_deref()
+                .ok_or_else(|| async_graphql::Error::new("totp_required"))?;
+            match totp_code.as_deref() {
+                None => return Err(async_graphql::Error::new("totp_required")),
+                Some(code) if !auth::verify_totp(secret, code) => {
+                    return Err(async_graphql::Error::new("totp_invalid"));
+                }
+                _ => {}
+            }
         }
 
         let token = auth::create_jwt(ClaimsInput::from(&user), &app.jwt_secret, 24 * 7)
@@ -168,6 +277,130 @@ impl MutationRoot {
             token,
             user: UserObject::from(user),
         })
+    }
+
+    /// Begins 2FA setup: generates a new TOTP secret, stores it on the
+    /// user's row (with `totp_enabled` still false until confirmed), and
+    /// returns the provisioning URI + raw secret for the frontend to render
+    /// as a QR code / manual-entry string.
+    async fn enable_two_factor(&self, ctx: &Context<'_>) -> async_graphql::Result<TwoFactorSetup> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let user = entity::prelude::User::find_by_id(claims.sub)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("user not found"))?;
+
+        let secret = auth::generate_totp_secret();
+        let provisioning_uri = auth::totp_provisioning_uri(&secret, &user.username, TOTP_ISSUER);
+
+        let mut active: entity::user::ActiveModel = user.into();
+        active.totp_secret = Set(Some(secret.clone()));
+        active.totp_enabled = Set(false);
+        active.update(&app.db).await?;
+
+        Ok(TwoFactorSetup {
+            secret,
+            provisioning_uri,
+        })
+    }
+
+    /// Confirms 2FA setup by verifying a code against the pending secret
+    /// stored by `enableTwoFactor`, then flips `totp_enabled` to true.
+    async fn confirm_two_factor(&self, ctx: &Context<'_>, code: String) -> async_graphql::Result<bool> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let user = entity::prelude::User::find_by_id(claims.sub)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("user not found"))?;
+
+        let secret = user
+            .totp_secret
+            .clone()
+            .ok_or_else(|| async_graphql::Error::new("no pending two-factor setup"))?;
+
+        if !auth::verify_totp(&secret, &code) {
+            return Err(async_graphql::Error::new("totp_invalid"));
+        }
+
+        let mut active: entity::user::ActiveModel = user.into();
+        active.totp_enabled = Set(true);
+        active.update(&app.db).await?;
+
+        Ok(true)
+    }
+
+    /// Disables 2FA for the current user, clearing the stored secret.
+    async fn disable_two_factor(&self, ctx: &Context<'_>) -> async_graphql::Result<bool> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let user = entity::prelude::User::find_by_id(claims.sub)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("user not found"))?;
+
+        let mut active: entity::user::ActiveModel = user.into();
+        active.totp_enabled = Set(false);
+        active.totp_secret = Set(None);
+        active.update(&app.db).await?;
+
+        Ok(true)
+    }
+
+    /// Grants or revokes site-admin status for a user. Restricted to
+    /// existing admins.
+    async fn admin_set_user_admin(
+        &self,
+        ctx: &Context<'_>,
+        user_id: Uuid,
+        is_admin: bool,
+    ) -> async_graphql::Result<UserObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+        if !claims.is_admin {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let user = entity::prelude::User::find_by_id(user_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("user not found"))?;
+
+        let mut active: entity::user::ActiveModel = user.into();
+        active.is_admin = Set(is_admin);
+        let user = active.update(&app.db).await?;
+
+        Ok(UserObject::from(user))
+    }
+
+    /// Deactivates a user account (blocks future logins). Restricted to
+    /// admins.
+    async fn admin_deactivate_user(&self, ctx: &Context<'_>, user_id: Uuid) -> async_graphql::Result<UserObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+        if !claims.is_admin {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let user = entity::prelude::User::find_by_id(user_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("user not found"))?;
+
+        let mut active: entity::user::ActiveModel = user.into();
+        active.deactivated_at = Set(Some(Utc::now()));
+        let user = active.update(&app.db).await?;
+
+        Ok(UserObject::from(user))
     }
 
     async fn create_repository(
@@ -192,6 +425,10 @@ impl MutationRoot {
             .init_repo(&owner.username, &name)
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
+        if let Err(e) = app.repo_manager.init_wiki(&owner.username, &name) {
+            tracing::warn!("failed to initialize wiki repo for {}/{name}: {e}", owner.username);
+        }
+
         let repo = entity::repository::ActiveModel {
             id: Set(Uuid::new_v4()),
             owner_type: Set("user".to_string()),
@@ -203,6 +440,15 @@ impl MutationRoot {
             created_at: Set(Utc::now()),
         };
         let repo = repo.insert(&app.db).await?;
+
+        record_activity(
+            app,
+            Some(repo.id),
+            claims.sub,
+            entity::activity_event::kind::REPO_CREATED,
+            format!("{} created repository {}", owner.username, repo.name),
+        )
+        .await;
 
         Ok(RepositoryObject::from_model(&app.db, repo).await)
     }
@@ -263,6 +509,7 @@ impl MutationRoot {
             state: Set(entity::issue::state::OPEN.to_string()),
             created_at: Set(Utc::now()),
             closed_at: Set(None),
+            milestone_id: Set(None),
         };
         let issue = issue.insert(&app.db).await?;
 
@@ -278,6 +525,15 @@ impl MutationRoot {
             "repository": { "id": repo.id, "name": repo.name },
         });
         let _ = app.webhook_dispatcher.dispatch(repo_id, "issues", payload).await;
+
+        record_activity(
+            app,
+            Some(repo.id),
+            claims.sub,
+            entity::activity_event::kind::ISSUE_OPENED,
+            format!("{} opened issue #{} on {}", claims.username, issue.number, repo.name),
+        )
+        .await;
 
         Ok(IssueObject::from(issue))
     }
@@ -321,6 +577,18 @@ impl MutationRoot {
             .webhook_dispatcher
             .dispatch(repo.id, "issue_comment", payload)
             .await;
+
+        if issue.author_id != claims.sub {
+            notify(
+                app,
+                issue.author_id,
+                entity::notification::kind::ISSUE_COMMENT,
+                repo.id,
+                issue.id,
+                format!("{} commented on issue #{}: {}", claims.username, issue.number, issue.title),
+            )
+            .await;
+        }
 
         Ok(IssueCommentObject::from(comment))
     }
@@ -383,6 +651,15 @@ impl MutationRoot {
             .dispatch(repo_id, "pull_request", payload)
             .await;
 
+        record_activity(
+            app,
+            Some(repo.id),
+            claims.sub,
+            entity::activity_event::kind::PR_OPENED,
+            format!("{} opened pull request #{} on {}", claims.username, pr.number, repo.name),
+        )
+        .await;
+
         Ok(PullRequestObject::from(pr))
     }
 
@@ -402,6 +679,34 @@ impl MutationRoot {
         let perm = repo_permission(app, &repo, claims.sub).await?;
         if perm < Some(Permission::Write) {
             return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        // Enforce branch protection: if any active rule for this repo matches
+        // the PR's target branch and requires a minimum number of approved
+        // reviews, count the approved `pr_reviews` rows for this PR and
+        // refuse to merge if the threshold isn't met.
+        let rules = entity::prelude::BranchProtectionRule::find()
+            .filter(entity::branch_protection_rule::Column::RepoId.eq(repo.id))
+            .all(&app.db)
+            .await?;
+        let matching_rule = rules.into_iter().find(|r| {
+            entity::branch_protection_rule::branch_matches_pattern(&r.branch_pattern, &pr.target_branch)
+        });
+        if let Some(rule) = matching_rule {
+            if rule.require_reviews_count > 0 {
+                let approved_count = entity::prelude::PrReview::find()
+                    .filter(entity::pr_review::Column::PrId.eq(pr.id))
+                    .filter(entity::pr_review::Column::State.eq(entity::pr_review::state::APPROVED))
+                    .all(&app.db)
+                    .await?
+                    .len() as i32;
+                if approved_count < rule.require_reviews_count {
+                    return Err(async_graphql::Error::new(format!(
+                        "branch protection: '{}' requires {} approved review(s), but only {} found",
+                        rule.branch_pattern, rule.require_reviews_count, approved_count
+                    )));
+                }
+            }
         }
 
         let owner_login = resolve_owner_login(&app.db, &repo.owner_type, repo.owner_id)
@@ -454,7 +759,195 @@ impl MutationRoot {
             .dispatch(repo.id, "pull_request", payload)
             .await;
 
+        if pr.author_id != claims.sub {
+            notify(
+                app,
+                pr.author_id,
+                entity::notification::kind::PR_MERGED,
+                repo.id,
+                pr.id,
+                format!("{} merged your pull request #{}: {}", claims.username, pr.number, pr.title),
+            )
+            .await;
+        }
+        record_activity(
+            app,
+            Some(repo.id),
+            claims.sub,
+            entity::activity_event::kind::PR_MERGED,
+            format!("{} merged pull request #{} on {}", claims.username, pr.number, repo.name),
+        )
+        .await;
+
         Ok(PullRequestObject::from(pr))
+    }
+
+    /// Creates or updates a wiki page (`{page}.md`) for a repository,
+    /// committing the change on the wiki repo's default branch. Requires
+    /// at least Write permission on the parent repository.
+    async fn write_wiki_page(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        page: String,
+        content: String,
+        message: String,
+    ) -> async_graphql::Result<String> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let repo = find_repo(app, repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm < Some(Permission::Write) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let owner_login = resolve_owner_login(&app.db, &repo.owner_type, repo.owner_id)
+            .await
+            .unwrap_or_default();
+
+        let author_email = format!("{}@users.noreply.local", claims.username);
+
+        let sha = app
+            .repo_manager
+            .wiki_write_page(
+                &owner_login,
+                &repo.name,
+                &page,
+                &content,
+                &claims.username,
+                &author_email,
+                &message,
+            )
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        Ok(sha)
+    }
+
+    /// Creates a branch protection rule for a repository. `branch_pattern`
+    /// supports a literal branch name (e.g. "main") or a trailing wildcard
+    /// (e.g. "release/*"). Requires Admin permission on the repository.
+    async fn create_branch_protection_rule(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        branch_pattern: String,
+        #[graphql(default)] require_reviews_count: i32,
+        #[graphql(default = true)] block_force_push: bool,
+    ) -> async_graphql::Result<BranchProtectionRuleObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let repo = find_repo(app, repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm != Some(Permission::Admin) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let rule = entity::branch_protection_rule::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            repo_id: Set(repo_id),
+            branch_pattern: Set(branch_pattern),
+            require_reviews_count: Set(require_reviews_count),
+            require_status_checks: Set(false),
+            block_force_push: Set(block_force_push),
+            created_at: Set(Utc::now()),
+        };
+        let rule = rule.insert(&app.db).await?;
+
+        Ok(BranchProtectionRuleObject::from(rule))
+    }
+
+    /// Submits a review on a pull request (approve / request changes /
+    /// comment), recording a `pr_reviews` row. This is the row that
+    /// `addReviewComment` attaches inline comments to, and that
+    /// `mergePullRequest` counts against branch protection rules.
+    async fn submit_pull_request_review(
+        &self,
+        ctx: &Context<'_>,
+        pr_id: Uuid,
+        state: String,
+        body: Option<String>,
+    ) -> async_graphql::Result<PrReviewObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let pr = entity::prelude::PullRequest::find_by_id(pr_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("pull request not found"))?;
+        let repo = find_repo(app, pr.repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm.is_none() {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let valid_states = [
+            entity::pr_review::state::APPROVED,
+            entity::pr_review::state::CHANGES_REQUESTED,
+            entity::pr_review::state::COMMENTED,
+        ];
+        if !valid_states.contains(&state.as_str()) {
+            return Err(async_graphql::Error::new(format!(
+                "invalid review state '{state}'; expected one of {valid_states:?}"
+            )));
+        }
+
+        let review = entity::pr_review::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            pr_id: Set(pr_id),
+            reviewer_id: Set(claims.sub),
+            state: Set(state),
+            body: Set(body),
+            created_at: Set(Utc::now()),
+        };
+        let review = review.insert(&app.db).await?;
+
+        Ok(PrReviewObject::from(review))
+    }
+
+    /// Adds an inline comment on a specific file/line of a pull request
+    /// review's diff.
+    async fn add_review_comment(
+        &self,
+        ctx: &Context<'_>,
+        review_id: Uuid,
+        file_path: String,
+        line_number: i32,
+        body: String,
+    ) -> async_graphql::Result<PrReviewCommentObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let review = entity::prelude::PrReview::find_by_id(review_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("review not found"))?;
+        let pr = entity::prelude::PullRequest::find_by_id(review.pr_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("pull request not found"))?;
+        let repo = find_repo(app, pr.repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm.is_none() {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let comment = entity::pr_review_comment::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            review_id: Set(review_id),
+            file_path: Set(file_path),
+            line_number: Set(line_number),
+            body: Set(body),
+            created_at: Set(Utc::now()),
+        };
+        let comment = comment.insert(&app.db).await?;
+
+        Ok(PrReviewCommentObject::from(comment))
     }
 
     async fn create_organization(
@@ -584,10 +1077,11 @@ impl MutationRoot {
         // would normally be persisted by a background task watching JobResults.
         let executor = app.actions_executor.clone();
         let jobs: Vec<_> = workflow.jobs.into_values().collect();
+        let secrets = load_repo_secrets(app, repo_id).await.unwrap_or_default();
         tokio::spawn(async move {
             for job in jobs {
                 let result = executor
-                    .run_job(&job, &[], Default::default(), |line| {
+                    .run_job(&job, &[], Default::default(), &secrets, |line| {
                         tracing::info!(target: "workflow", "{line}");
                     })
                     .await;
@@ -606,6 +1100,7 @@ impl MutationRoot {
         name: String,
         image: Option<String>,
         repo_id: Option<Uuid>,
+        auto_stop_minutes: Option<i32>,
     ) -> async_graphql::Result<DevWorkspaceObject> {
         let app = ctx.data::<AppContext>()?;
         let req = ctx.data::<RequestContext>()?;
@@ -648,6 +1143,8 @@ impl MutationRoot {
             status: Set(entity::dev_workspace::status::RUNNING.to_string()),
             container_id: Set(Some(handle.container_id)),
             created_at: Set(Utc::now()),
+            auto_stop_minutes: Set(auto_stop_minutes),
+            last_activity_at: Set(Some(Utc::now())),
         };
         let workspace = workspace.insert(&app.db).await?;
         Ok(DevWorkspaceObject::from(workspace))
@@ -732,6 +1229,354 @@ impl MutationRoot {
         entity::prelude::DevWorkspace::delete_by_id(workspace.id)
             .exec(&app.db)
             .await?;
+        Ok(true)
+    }
+
+    // ---- Labels ----
+
+    async fn create_label(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        name: String,
+        color: String,
+    ) -> async_graphql::Result<LabelObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let repo = find_repo(app, repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm < Some(Permission::Write) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let label = entity::label::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            repo_id: Set(repo_id),
+            name: Set(name),
+            color: Set(color),
+        };
+        let label = label.insert(&app.db).await?;
+        Ok(LabelObject::from(label))
+    }
+
+    async fn add_label_to_issue(
+        &self,
+        ctx: &Context<'_>,
+        issue_id: Uuid,
+        label_id: Uuid,
+    ) -> async_graphql::Result<IssueObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let issue = entity::prelude::Issue::find_by_id(issue_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("issue not found"))?;
+        let repo = find_repo(app, issue.repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm < Some(Permission::Write) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let label = entity::prelude::Label::find_by_id(label_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("label not found"))?;
+        if label.repo_id != repo.id {
+            return Err(async_graphql::Error::new("label does not belong to this repository"));
+        }
+
+        let existing = entity::prelude::IssueLabel::find()
+            .filter(entity::issue_label::Column::IssueId.eq(issue_id))
+            .filter(entity::issue_label::Column::LabelId.eq(label_id))
+            .one(&app.db)
+            .await?;
+        if existing.is_none() {
+            let link = entity::issue_label::ActiveModel {
+                issue_id: Set(issue_id),
+                label_id: Set(label_id),
+            };
+            link.insert(&app.db).await?;
+        }
+
+        Ok(IssueObject::from(issue))
+    }
+
+    async fn remove_label_from_issue(
+        &self,
+        ctx: &Context<'_>,
+        issue_id: Uuid,
+        label_id: Uuid,
+    ) -> async_graphql::Result<IssueObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let issue = entity::prelude::Issue::find_by_id(issue_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("issue not found"))?;
+        let repo = find_repo(app, issue.repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm < Some(Permission::Write) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        entity::prelude::IssueLabel::delete_many()
+            .filter(entity::issue_label::Column::IssueId.eq(issue_id))
+            .filter(entity::issue_label::Column::LabelId.eq(label_id))
+            .exec(&app.db)
+            .await?;
+
+        Ok(IssueObject::from(issue))
+    }
+
+    // ---- Milestones ----
+
+    async fn create_milestone(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        title: String,
+        description: Option<String>,
+        due_date: Option<chrono::DateTime<Utc>>,
+    ) -> async_graphql::Result<MilestoneObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let repo = find_repo(app, repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm < Some(Permission::Write) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let milestone = entity::milestone::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            repo_id: Set(repo_id),
+            title: Set(title),
+            description: Set(description),
+            due_date: Set(due_date),
+            state: Set(entity::milestone::state::OPEN.to_string()),
+            created_at: Set(Utc::now()),
+        };
+        let milestone = milestone.insert(&app.db).await?;
+        Ok(MilestoneObject::from(milestone))
+    }
+
+    async fn set_issue_milestone(
+        &self,
+        ctx: &Context<'_>,
+        issue_id: Uuid,
+        milestone_id: Option<Uuid>,
+    ) -> async_graphql::Result<IssueObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let issue = entity::prelude::Issue::find_by_id(issue_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("issue not found"))?;
+        let repo = find_repo(app, issue.repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm < Some(Permission::Write) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        if let Some(mid) = milestone_id {
+            let milestone = entity::prelude::Milestone::find_by_id(mid)
+                .one(&app.db)
+                .await?
+                .ok_or_else(|| async_graphql::Error::new("milestone not found"))?;
+            if milestone.repo_id != repo.id {
+                return Err(async_graphql::Error::new(
+                    "milestone does not belong to this repository",
+                ));
+            }
+        }
+
+        let mut active: entity::issue::ActiveModel = issue.into();
+        active.milestone_id = Set(milestone_id);
+        let issue = active.update(&app.db).await?;
+
+        Ok(IssueObject::from(issue))
+    }
+
+    // ---- Projects ----
+
+    async fn create_project(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        name: String,
+    ) -> async_graphql::Result<ProjectObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let repo = find_repo(app, repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm < Some(Permission::Write) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let project = entity::project::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            repo_id: Set(repo_id),
+            name: Set(name),
+            created_at: Set(Utc::now()),
+        };
+        let project = project.insert(&app.db).await?;
+        Ok(ProjectObject::from(project))
+    }
+
+    async fn add_project_column(
+        &self,
+        ctx: &Context<'_>,
+        project_id: Uuid,
+        name: String,
+        position: i32,
+    ) -> async_graphql::Result<ProjectColumnObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let project = entity::prelude::Project::find_by_id(project_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("project not found"))?;
+        let repo = find_repo(app, project.repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm < Some(Permission::Write) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let column = entity::project_column::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            project_id: Set(project_id),
+            name: Set(name),
+            position: Set(position),
+        };
+        let column = column.insert(&app.db).await?;
+        Ok(ProjectColumnObject::from(column))
+    }
+
+    async fn add_card_to_column(
+        &self,
+        ctx: &Context<'_>,
+        column_id: Uuid,
+        issue_id: Uuid,
+        position: i32,
+    ) -> async_graphql::Result<ProjectCardObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let column = entity::prelude::ProjectColumn::find_by_id(column_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("project column not found"))?;
+        let project = entity::prelude::Project::find_by_id(column.project_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("project not found"))?;
+        let repo = find_repo(app, project.repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm < Some(Permission::Write) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let issue = entity::prelude::Issue::find_by_id(issue_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("issue not found"))?;
+        if issue.repo_id != repo.id {
+            return Err(async_graphql::Error::new("issue does not belong to this repository"));
+        }
+
+        let card = entity::project_card::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            column_id: Set(column_id),
+            issue_id: Set(Some(issue_id)),
+            pull_request_id: Set(None),
+            position: Set(position),
+        };
+        let card = card.insert(&app.db).await?;
+        Ok(ProjectCardObject::from(card))
+    }
+
+    // ---- Notifications ----
+
+    /// Marks a notification as read. Only the notification's owner may do this.
+    async fn mark_notification_read(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<NotificationObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let notification = entity::prelude::Notification::find_by_id(id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("notification not found"))?;
+        if notification.user_id != claims.sub {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let mut active: entity::notification::ActiveModel = notification.into();
+        active.read_at = Set(Some(Utc::now()));
+        let notification = active.update(&app.db).await?;
+
+        Ok(NotificationObject::from(notification))
+    }
+
+    /// Sets (creates or overwrites) an encrypted Actions secret for a
+    /// repository. Requires Admin permission on the repository. Secrets are
+    /// write-only: there is no query to read the value back, only
+    /// `repository.secretNames` to list which names exist.
+    async fn set_repo_secret(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        name: String,
+        value: String,
+    ) -> async_graphql::Result<bool> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let repo = find_repo(app, repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm != Some(Permission::Admin) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let key = secrets_encryption_key().map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let encrypted_value = actions::encrypt_secret(&key, &value);
+
+        let existing = entity::prelude::RepoSecret::find()
+            .filter(entity::repo_secret::Column::RepoId.eq(repo_id))
+            .filter(entity::repo_secret::Column::Name.eq(name.clone()))
+            .one(&app.db)
+            .await?;
+
+        if let Some(existing) = existing {
+            let mut active: entity::repo_secret::ActiveModel = existing.into();
+            active.encrypted_value = Set(encrypted_value);
+            active.update(&app.db).await?;
+        } else {
+            let secret = entity::repo_secret::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                repo_id: Set(repo_id),
+                name: Set(name),
+                encrypted_value: Set(encrypted_value),
+                created_at: Set(Utc::now()),
+            };
+            secret.insert(&app.db).await?;
+        }
+
         Ok(true)
     }
 }

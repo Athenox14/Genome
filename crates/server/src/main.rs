@@ -56,8 +56,10 @@ async fn main() -> anyhow::Result<()> {
 
     let schema = graphql_api::build_schema(app_ctx.clone());
 
-    let state = ServerState { schema, app_ctx };
+    let state = ServerState { schema, app_ctx: app_ctx.clone() };
     let limiter = rate_limit::RateLimiter::new();
+
+    tokio::spawn(auto_stop_dev_workspaces(app_ctx));
 
     // CORS is intentionally permissive (the frontend runs on a different
     // port/origin by design). `CorsLayer::permissive()` allows any origin,
@@ -99,11 +101,30 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     tracing::info!("listening on {}", config.listen_addr);
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+
+    let ssh_state = Arc::new(ssh_server::SharedState {
+        db: db.clone(),
+        repo_manager: repo_manager.clone(),
+    });
+    let ssh_config = ssh_server::SshServerConfig {
+        listen_addr: config.ssh_listen_addr.clone(),
+        host_key_path: std::path::PathBuf::from(&config.ssh_host_key_path),
+    };
+
+    let http_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    });
+    let ssh_task = tokio::spawn(async move { ssh_server::run(ssh_config, ssh_state).await });
+
+    let (http_result, ssh_result) = tokio::join!(http_task, ssh_task);
+    http_result??;
+    if let Err(e) = ssh_result? {
+        tracing::error!("SSH server exited with error: {e}");
+    }
 
     Ok(())
 }
@@ -225,12 +246,20 @@ async fn receive_pack_handler(
         let app_ctx = state.app_ctx.clone();
         let owner_clone = owner.clone();
         let repo_clone = repo_name.clone();
+        let changes_clone = changes.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                process_push_workflows(app_ctx, owner_clone, repo_clone, changes).await
+                process_push_workflows(app_ctx, owner_clone, repo_clone, changes_clone).await
             {
                 tracing::warn!("post-push workflow processing failed: {e}");
             }
+        });
+
+        let app_ctx = state.app_ctx.clone();
+        let owner_clone = owner.clone();
+        let repo_clone = repo_name.clone();
+        tokio::spawn(async move {
+            check_force_push_against_protection(app_ctx, owner_clone, repo_clone, changes).await;
         });
     }
 
@@ -266,6 +295,8 @@ async fn process_push_workflows(
         return Ok(());
     };
 
+    let secrets = load_repo_secrets(&app_ctx, repo_row.id).await.unwrap_or_default();
+
     for (ref_name, old_sha, new_sha) in changes {
         if new_sha == ZERO_SHA {
             // Branch deletion: nothing to run.
@@ -277,6 +308,26 @@ async fn process_push_workflows(
             "before": old_sha,
             "after": new_sha,
         });
+
+        // Best-effort activity feed entry for the push. The pusher's identity
+        // isn't threaded through git's smart-HTTP handlers here, so we
+        // attribute the push to the repository owner account when it's a
+        // user-owned repo (organization-owned pushes are skipped rather than
+        // guessing at an actor).
+        if repo_row.owner_type == "user" {
+            let event = entity::activity_event::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                repo_id: Set(Some(repo_row.id)),
+                actor_id: Set(repo_row.owner_id),
+                kind: Set(entity::activity_event::kind::PUSH.to_string()),
+                summary: Set(format!("push to {ref_name} on {owner}/{repo}")),
+                created_at: Set(chrono::Utc::now()),
+            };
+            if let Err(e) = event.insert(&app_ctx.db).await {
+                tracing::warn!("failed to insert activity event for push: {e}");
+            }
+        }
+
         let _ = app_ctx
             .webhook_dispatcher
             .dispatch(repo_row.id, "push", push_payload)
@@ -355,7 +406,7 @@ async fn process_push_workflows(
                 let job = job.clone();
                 let archive = archive.clone();
                 let result = executor
-                    .run_job(&job, &archive, env_extra, |line| {
+                    .run_job(&job, &archive, env_extra, &secrets, |line| {
                         tracing::info!("[workflow] {line}");
                     })
                     .await;
@@ -384,8 +435,171 @@ async fn process_push_workflows(
     Ok(())
 }
 
+/// Best-effort force-push detection for protected branches.
+///
+/// By the time this runs, `git-receive-pack` has already accepted the push
+/// (git's real force-push rejection happens in a pre-receive hook, which
+/// would require running a hook binary as part of `handle_service_rpc` — a
+/// larger change than warranted here). Instead we compare each updated ref's
+/// old/new tips: if the old tip is not an ancestor of the new tip, history
+/// was rewritten (a force push). If that ref is a branch matching an active
+/// `branch_protection_rules` row with `block_force_push` set, we log a
+/// warning so operators/audits can see the violation. This does not undo or
+/// block the push.
+async fn check_force_push_against_protection(
+    app_ctx: AppContext,
+    owner: String,
+    repo: String,
+    changes: Vec<(String, String, String)>,
+) {
+    const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
+    let repo_row = match entity::prelude::Repository::find()
+        .filter(entity::repository::Column::Name.eq(repo.clone()))
+        .one(&app_ctx.db)
+        .await
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("branch protection check: failed to load repository row: {e}");
+            return;
+        }
+    };
+
+    let rules = match entity::prelude::BranchProtectionRule::find()
+        .filter(entity::branch_protection_rule::Column::RepoId.eq(repo_row.id))
+        .all(&app_ctx.db)
+        .await
+    {
+        Ok(rules) => rules,
+        Err(e) => {
+            tracing::warn!("branch protection check: failed to load rules: {e}");
+            return;
+        }
+    };
+    if rules.is_empty() {
+        return;
+    }
+
+    for (ref_name, old_sha, new_sha) in changes {
+        if old_sha == ZERO_SHA || new_sha == ZERO_SHA {
+            // Branch creation or deletion, not a force-push.
+            continue;
+        }
+        let Some(branch) = ref_name.strip_prefix("refs/heads/") else {
+            continue;
+        };
+
+        let Some(rule) = rules
+            .iter()
+            .find(|r| entity::branch_protection_rule::branch_matches_pattern(&r.branch_pattern, branch))
+        else {
+            continue;
+        };
+        if !rule.block_force_push {
+            continue;
+        }
+
+        match app_ctx.repo_manager.is_ancestor(&owner, &repo, &old_sha, &new_sha) {
+            Ok(true) => {} // fast-forward, fine
+            Ok(false) => {
+                tracing::warn!(
+                    "force push detected on protected branch '{branch}' of {owner}/{repo} \
+                     ({old_sha} -> {new_sha}); block_force_push is set but was not enforced \
+                     pre-receive (see check_force_push_against_protection doc comment)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("branch protection check: failed to determine ancestry for {owner}/{repo} {branch}: {e}");
+            }
+        }
+    }
+}
+
 fn strip_git_suffix(name: &str) -> &str {
     name.strip_suffix(".git").unwrap_or(name)
+}
+
+/// Loads and decrypts all Actions secrets for a repository, for injection
+/// into workflow job runs triggered by a push. Best-effort: if
+/// `SECRETS_ENCRYPTION_KEY` is unset or a value fails to decrypt, that
+/// secret (or all secrets) is skipped with a warning rather than aborting
+/// the workflow run.
+async fn load_repo_secrets(
+    app_ctx: &AppContext,
+    repo_id: Uuid,
+) -> anyhow::Result<HashMap<String, String>> {
+    let encoded = std::env::var("SECRETS_ENCRYPTION_KEY")
+        .map_err(|_| anyhow::anyhow!("SECRETS_ENCRYPTION_KEY environment variable must be set"))?;
+    let key = actions::key_from_base64(&encoded)?;
+
+    let rows = entity::prelude::RepoSecret::find()
+        .filter(entity::repo_secret::Column::RepoId.eq(repo_id))
+        .all(&app_ctx.db)
+        .await?;
+
+    let mut out = HashMap::new();
+    for row in rows {
+        match actions::decrypt_secret(&key, &row.encrypted_value) {
+            Ok(value) => {
+                out.insert(row.name, value);
+            }
+            Err(e) => {
+                tracing::warn!("failed to decrypt secret {} for repo {repo_id}: {e}", row.name);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Background task: every 60s, stop any running dev workspace whose
+/// `auto_stop_minutes` timer has elapsed since `last_activity_at`.
+async fn auto_stop_dev_workspaces(app_ctx: AppContext) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+
+        let workspaces = match entity::prelude::DevWorkspace::find()
+            .filter(entity::dev_workspace::Column::Status.eq(entity::dev_workspace::status::RUNNING))
+            .all(&app_ctx.db)
+            .await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("auto-stop: failed to list dev workspaces: {e}");
+                continue;
+            }
+        };
+
+        let now = chrono::Utc::now();
+        for workspace in workspaces {
+            let (Some(auto_stop_minutes), Some(last_activity_at)) =
+                (workspace.auto_stop_minutes, workspace.last_activity_at)
+            else {
+                continue;
+            };
+            let deadline = last_activity_at + chrono::Duration::minutes(auto_stop_minutes as i64);
+            if deadline >= now {
+                continue;
+            }
+
+            let Some(container_id) = workspace.container_id.clone() else {
+                continue;
+            };
+
+            if let Err(e) = app_ctx.workspace_manager.stop_workspace(&container_id).await {
+                tracing::warn!("auto-stop: failed to stop workspace {}: {e}", workspace.id);
+                continue;
+            }
+
+            let mut active: entity::dev_workspace::ActiveModel = workspace.into();
+            active.status = Set(entity::dev_workspace::status::STOPPED.to_string());
+            if let Err(e) = active.update(&app_ctx.db).await {
+                tracing::warn!("auto-stop: failed to update workspace status: {e}");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -420,6 +634,21 @@ async fn workspace_proxy_handler(
         .ok_or_else(|| ServerError::BadRequest("workspace has no container".to_string()))?;
 
     let host_port = resolve_host_port(&state.app_ctx.workspace_manager, &container_id).await?;
+
+    // Best-effort activity bump: never block the proxied request on this.
+    {
+        let db = state.app_ctx.db.clone();
+        tokio::spawn(async move {
+            let mut active = entity::dev_workspace::ActiveModel {
+                id: Set(workspace_id),
+                ..Default::default()
+            };
+            active.last_activity_at = Set(Some(chrono::Utc::now()));
+            if let Err(e) = active.update(&db).await {
+                tracing::debug!("failed to bump workspace last_activity_at: {e}");
+            }
+        });
+    }
 
     let req_path = format!("/{path}");
     let response = dev_env::proxy::proxy_to_workspace(host_port, &req_path, req)

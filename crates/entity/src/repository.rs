@@ -33,6 +33,10 @@ pub enum Relation {
     WorkflowRun,
     #[sea_orm(has_many = "super::dev_workspace::Entity")]
     DevWorkspace,
+    #[sea_orm(has_many = "super::milestone::Entity")]
+    Milestone,
+    #[sea_orm(has_many = "super::project::Entity")]
+    Project,
 }
 
 impl Related<super::repo_collaborator::Entity> for Entity {
@@ -68,6 +72,16 @@ impl Related<super::workflow_run::Entity> for Entity {
 impl Related<super::dev_workspace::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::DevWorkspace.def()
+    }
+}
+impl Related<super::milestone::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Milestone.def()
+    }
+}
+impl Related<super::project::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Project.def()
     }
 }
 

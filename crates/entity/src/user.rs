@@ -14,6 +14,10 @@ pub struct Model {
     pub is_admin: bool,
     pub avatar_url: Option<String>,
     pub created_at: ChronoDateTimeUtc,
+    pub totp_secret: Option<String>,
+    #[sea_orm(default_value = false)]
+    pub totp_enabled: bool,
+    pub deactivated_at: Option<ChronoDateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
