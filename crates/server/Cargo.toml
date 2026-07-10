@@ -1,0 +1,31 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+entity = { path = "../entity" }
+migration = { path = "../migration" }
+git-core = { path = "../git-core" }
+auth = { path = "../auth" }
+actions = { path = "../actions" }
+dev-env = { path = "../dev-env" }
+graphql-api = { path = "../graphql-api" }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+sea-orm = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-graphql-axum = { workspace = true }
+async-graphql = { workspace = true }
+futures-util = { workspace = true }
+bollard = { workspace = true }

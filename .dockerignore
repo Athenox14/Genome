@@ -1,0 +1,16 @@
+target/
+**/target/
+node_modules/
+**/node_modules/
+frontend/.nuxt/
+frontend/.output/
+.git/
+.github/
+data/
+*.env
+.env
+.env.*
+config/genome.toml
+*.md
+.vscode/
+.idea/

@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/entity",
+    "crates/migration",
+    "crates/git-core",
+    "crates/auth",
+    "crates/actions",
+    "crates/graphql-api",
+    "crates/dev-env",
+    "crates/server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
+async-graphql = { version = "7", features = ["chrono", "uuid"] }
+async-graphql-axum = "7"
+sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "with-chrono", "with-uuid", "with-json"] }
+sea-orm-migration = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+git2 = "0.19"
+jsonwebtoken = "9"
+argon2 = "0.5"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bollard = "0.17"
+serde_yaml = "0.9"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+futures-util = "0.3"
+tar = "0.4"

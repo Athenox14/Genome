@@ -1,0 +1,26 @@
+# Rust
+target/
+**/target/
+Cargo.lock.bak
+
+# Node / frontend
+node_modules/
+**/node_modules/
+frontend/.nuxt/
+frontend/.output/
+frontend/.env
+frontend/dist/
+
+# Environment / secrets
+.env
+.env.*
+config/genome.toml
+
+# Local dev data (bare git repos, postgres volume dumps, etc.)
+data/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

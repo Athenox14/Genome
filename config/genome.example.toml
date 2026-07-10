@@ -1,0 +1,28 @@
+# Example configuration for the Genome server.
+#
+# Copy this file to `config/genome.toml` for local overrides (git-ignored),
+# or supply the equivalent environment variables — env vars take
+# precedence over values in this file. Names below show the env var
+# each setting corresponds to.
+
+# Postgres connection string used by sea-orm.
+# Env: DATABASE_URL
+database_url = "postgres://genome:genome@localhost:5432/genome"
+
+# Secret used to sign/verify JWTs issued by the auth crate.
+# MUST be overridden with a long, random value in any non-local environment.
+# Env: JWT_SECRET
+jwt_secret = "change-me-in-production"
+
+# Filesystem path under which bare git repositories are stored.
+# Env: REPOS_ROOT_PATH
+repos_root_path = "/data/repos"
+
+# Address/port the HTTP (Axum + async-graphql) server binds to.
+# Env: LISTEN_ADDR
+listen_addr = "0.0.0.0:8000"
+
+# Path to the Docker daemon socket used by the actions/dev-env crates to
+# spawn ephemeral containers (e.g. for CI actions or dev environments).
+# Env: DOCKER_SOCKET_PATH
+docker_socket_path = "/var/run/docker.sock"
