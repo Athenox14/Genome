@@ -10,7 +10,7 @@ use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
 use migration::MigratorTrait;
@@ -55,17 +55,7 @@ impl auth::TokenLookup for DbTokenLookup {
             return self.claims_for_user(token.user_id).await;
         }
 
-        // Fall back to OAuth2-issued access tokens (same token_hash-keyed
-        // lookup, distinct table/expiry semantics: OAuth2 tokens always
-        // expire, no optional-expiry branch needed).
-        let oauth_token = entity::prelude::Oauth2AccessToken::find_by_id(token_hash.to_string())
-            .one(&self.db)
-            .await
-            .ok()??;
-        if oauth_token.expires_at < chrono::Utc::now() {
-            return None;
-        }
-        self.claims_for_user(oauth_token.user_id).await
+        None
     }
 }
 
@@ -172,11 +162,6 @@ async fn main() -> anyhow::Result<()> {
             "/workspaces/:id/proxy/*path",
             get(workspace_proxy_handler).post(workspace_proxy_handler),
         )
-        .route(
-            "/oauth/authorize",
-            get(oauth_authorize_handler),
-        )
-        .route("/oauth/token", post(oauth_token_handler))
         .route(
             "/packages/:owner/:name/:version",
             put(package_upload_handler).get(package_download_handler),
@@ -1041,241 +1026,6 @@ async fn resolve_host_port(
         .find(|h| h.container_id == container_id)
         .map(|h| h.host_port)
         .ok_or_else(|| ServerError::NotFound("workspace container not found".to_string()))
-}
-
-// ---------------------------------------------------------------------
-// OAuth2 provider
-// ---------------------------------------------------------------------
-//
-// Genome acting AS an OAuth2 identity provider for third-party apps (the
-// reverse of "login via Google"): third-party apps register an
-// `oauth2_applications` row (via the `createOAuth2Application` GraphQL
-// mutation) and then redirect users through `/oauth/authorize` to obtain a
-// short-lived authorization code, which they exchange at `/oauth/token` for
-// a bearer access token.
-//
-// NOTE (scope cut): the issued OAuth2 access tokens are not yet wired into
-// `extract_user_from_headers`/`TokenLookup`, so they cannot (currently)
-// authenticate GraphQL requests the way personal access tokens do. That
-// integration was explicitly deprioritized per the task's cut list in favor
-// of getting both HTTP routes below fully working first.
-
-/// Percent-decodes a `application/x-www-form-urlencoded` component
-/// (`+` -> space, `%XX` -> byte). Minimal, dependency-free implementation
-/// sufficient for the plain ASCII client_id/secret/code/redirect_uri values
-/// exchanged by this simplified OAuth2 flow.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    out.push(byte);
-                    i += 3;
-                } else {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Percent-encodes a string for safe embedding as a single query-string
-/// value (e.g. the `then=` redirect target).
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-/// Parses an `application/x-www-form-urlencoded` body into a key/value map.
-fn parse_form_body(body: &[u8]) -> HashMap<String, String> {
-    let text = String::from_utf8_lossy(body);
-    let mut map = HashMap::new();
-    for pair in text.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let mut parts = pair.splitn(2, '=');
-        let key = parts.next().unwrap_or_default();
-        let value = parts.next().unwrap_or_default();
-        map.insert(percent_decode(key), percent_decode(value));
-    }
-    map
-}
-
-/// `GET /oauth/authorize?client_id=&redirect_uri=&response_type=code&scope=`
-///
-/// Requires the requesting user to already be authenticated (via JWT bearer
-/// token or PAT, same as GraphQL). If not authenticated, redirects (302) to
-/// the frontend's `/login?then=<url-encoded original request url>` so the
-/// user can log in and be sent back here. If authenticated: validates
-/// `client_id` exists and that `redirect_uri` matches the one stored for the
-/// application, generates a short-lived (10 minute) authorization code, and
-/// redirects (302) to `{redirect_uri}?code={code}`.
-async fn oauth_authorize_handler(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
-) -> ServerResult<Response> {
-    let client_id = params
-        .get("client_id")
-        .cloned()
-        .ok_or_else(|| ServerError::BadRequest("missing client_id".to_string()))?;
-    let redirect_uri = params
-        .get("redirect_uri")
-        .cloned()
-        .ok_or_else(|| ServerError::BadRequest("missing redirect_uri".to_string()))?;
-
-    let user = auth::extract_user_from_headers(&headers, &state.app_ctx.jwt_secret, Some(&DbTokenLookup { db: state.app_ctx.db.clone() })).await;
-
-    let Some(claims) = user else {
-        let query = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
-        let original_url = format!("/oauth/authorize?{query}");
-        let login_url = format!(
-            "{}/login?then={}",
-            state.config.frontend_url.trim_end_matches('/'),
-            percent_encode(&original_url)
-        );
-        return Ok(Redirect::to(&login_url).into_response());
-    };
-
-    let application = entity::prelude::Oauth2Application::find()
-        .filter(entity::oauth2_application::Column::ClientId.eq(client_id))
-        .one(&state.app_ctx.db)
-        .await?
-        .ok_or_else(|| ServerError::BadRequest("unknown client_id".to_string()))?;
-
-    if application.redirect_uri != redirect_uri {
-        return Err(ServerError::BadRequest(
-            "redirect_uri does not match the application's registered redirect_uri".to_string(),
-        ));
-    }
-
-    let (code, _) = auth::generate_access_token();
-    let code_row = entity::oauth2_authorization_code::ActiveModel {
-        code: Set(code.clone()),
-        application_id: Set(application.id),
-        user_id: Set(claims.sub),
-        redirect_uri: Set(redirect_uri.clone()),
-        expires_at: Set(chrono::Utc::now() + chrono::Duration::minutes(10)),
-        used: Set(false),
-    };
-    code_row.insert(&state.app_ctx.db).await?;
-
-    let redirect_to = format!("{redirect_uri}?code={code}");
-    Ok(Redirect::to(&redirect_to).into_response())
-}
-
-/// `POST /oauth/token` — form (`application/x-www-form-urlencoded`) or JSON
-/// body with `client_id`, `client_secret`, `code`, `redirect_uri`,
-/// `grant_type`. Validates the client credentials against the stored hash,
-/// validates the authorization code (exists, not expired, not used, matches
-/// the application and redirect_uri), marks it used, then issues a 1-hour
-/// bearer access token and returns
-/// `{access_token, token_type: "bearer", expires_in}`.
-async fn oauth_token_handler(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> ServerResult<Response> {
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let params: HashMap<String, String> = if content_type.contains("application/json") {
-        serde_json::from_slice(&body)
-            .map_err(|e| ServerError::BadRequest(format!("invalid JSON body: {e}")))?
-    } else {
-        parse_form_body(&body)
-    };
-
-    let get_param = |key: &str| -> ServerResult<String> {
-        params
-            .get(key)
-            .cloned()
-            .ok_or_else(|| ServerError::BadRequest(format!("missing {key}")))
-    };
-
-    let client_id = get_param("client_id")?;
-    let client_secret = get_param("client_secret")?;
-    let code = get_param("code")?;
-    let redirect_uri = get_param("redirect_uri")?;
-    let _grant_type = params.get("grant_type").cloned().unwrap_or_default();
-
-    let application = entity::prelude::Oauth2Application::find()
-        .filter(entity::oauth2_application::Column::ClientId.eq(client_id))
-        .one(&state.app_ctx.db)
-        .await?
-        .ok_or_else(|| ServerError::BadRequest("invalid client_id or client_secret".to_string()))?;
-
-    if auth::hash_token(&client_secret) != application.client_secret_hash {
-        return Err(ServerError::BadRequest(
-            "invalid client_id or client_secret".to_string(),
-        ));
-    }
-
-    let code_row = entity::prelude::Oauth2AuthorizationCode::find_by_id(code)
-        .one(&state.app_ctx.db)
-        .await?
-        .ok_or_else(|| ServerError::BadRequest("invalid or expired authorization code".to_string()))?;
-
-    if code_row.used
-        || code_row.expires_at < chrono::Utc::now()
-        || code_row.application_id != application.id
-        || code_row.redirect_uri != redirect_uri
-    {
-        return Err(ServerError::BadRequest(
-            "invalid or expired authorization code".to_string(),
-        ));
-    }
-
-    let user_id = code_row.user_id;
-    let mut used_code: entity::oauth2_authorization_code::ActiveModel = code_row.into();
-    used_code.used = Set(true);
-    used_code.update(&state.app_ctx.db).await?;
-
-    let (access_token, access_token_hash) = auth::generate_access_token();
-    const EXPIRES_IN_SECONDS: i64 = 3600;
-    let token_row = entity::oauth2_access_token::ActiveModel {
-        token_hash: Set(access_token_hash),
-        application_id: Set(application.id),
-        user_id: Set(user_id),
-        scopes: Set(String::new()),
-        expires_at: Set(chrono::Utc::now() + chrono::Duration::seconds(EXPIRES_IN_SECONDS)),
-    };
-    token_row.insert(&state.app_ctx.db).await?;
-
-    Ok(axum::Json(serde_json::json!({
-        "access_token": access_token,
-        "token_type": "bearer",
-        "expires_in": EXPIRES_IN_SECONDS,
-    }))
-    .into_response())
 }
 
 // ---------------------------------------------------------------------

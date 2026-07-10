@@ -648,15 +648,6 @@ impl From<entity::package::Model> for PackageObject {
     }
 }
 
-/// Returned once, at creation time, from `createOAuth2Application`. The
-/// plaintext `client_secret` is never stored or retrievable again — only its
-/// hash is persisted.
-#[derive(SimpleObject, Clone)]
-pub struct OAuth2ApplicationCreated {
-    pub client_id: String,
-    pub client_secret: String,
-}
-
 #[derive(SimpleObject, Clone)]
 pub struct ActivityEventObject {
     pub id: Uuid,

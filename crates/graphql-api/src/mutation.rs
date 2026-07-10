@@ -12,7 +12,7 @@ use crate::context::{AppContext, RequestContext};
 use crate::types::{
     resolve_owner_login, AccessTokenCreated, AccessTokenObject, AuthPayload,
     BranchProtectionRuleObject, DevWorkspaceObject, IssueCommentObject, IssueObject, LabelObject,
-    MilestoneObject, NotificationObject, OAuth2ApplicationCreated, OrganizationObject,
+    MilestoneObject, NotificationObject, OrganizationObject,
     PrReviewCommentObject, PrReviewObject, ProjectCardObject, ProjectColumnObject, ProjectObject,
     PullRequestObject, RepositoryObject, TwoFactorSetup, UserObject, WebhookObject,
     WorkflowRunObject,
@@ -2131,41 +2131,6 @@ impl MutationRoot {
         Ok(true)
     }
 
-    /// Registers a new OAuth2 application owned by the current user, acting
-    /// as a third-party client of Genome's own OAuth2 provider (the reverse
-    /// of "login via Google" — here Genome is the identity provider). The
-    /// plaintext `client_secret` is returned exactly once; only its hash is
-    /// persisted, following the same `generate_access_token`/`hash_token`
-    /// pattern used for personal access tokens.
-    async fn create_oauth2_application(
-        &self,
-        ctx: &Context<'_>,
-        name: String,
-        redirect_uri: String,
-    ) -> async_graphql::Result<OAuth2ApplicationCreated> {
-        let app = ctx.data::<AppContext>()?;
-        let req = ctx.data::<RequestContext>()?;
-        let claims = require_user(req)?;
-
-        let client_id = format!("genome_client_{}", Uuid::new_v4().simple());
-        let (client_secret, client_secret_hash) = auth::generate_access_token();
-
-        let application = entity::oauth2_application::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            owner_id: Set(claims.sub),
-            name: Set(name),
-            client_id: Set(client_id.clone()),
-            client_secret_hash: Set(client_secret_hash),
-            redirect_uri: Set(redirect_uri),
-            created_at: Set(Utc::now()),
-        };
-        application.insert(&app.db).await?;
-
-        Ok(OAuth2ApplicationCreated {
-            client_id,
-            client_secret,
-        })
-    }
 
     // ---- Personal access tokens ----
 

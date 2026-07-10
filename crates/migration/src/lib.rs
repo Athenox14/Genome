@@ -11,7 +11,6 @@ mod m20260710_000009_activity_events;
 mod m20260710_000010_repo_secrets;
 mod m20260710_000011_workflow_artifacts;
 mod m20260710_000012_dev_workspace_autostop;
-mod m20260710_000013_oauth2;
 mod m20260710_000014_packages;
 mod m20260710_000015_repo_fork;
 mod m20260710_000016_repo_mirrors;
@@ -33,7 +32,6 @@ impl MigratorTrait for Migrator {
             Box::new(m20260710_000010_repo_secrets::Migration),
             Box::new(m20260710_000011_workflow_artifacts::Migration),
             Box::new(m20260710_000012_dev_workspace_autostop::Migration),
-            Box::new(m20260710_000013_oauth2::Migration),
             Box::new(m20260710_000014_packages::Migration),
             Box::new(m20260710_000015_repo_fork::Migration),
             Box::new(m20260710_000016_repo_mirrors::Migration),

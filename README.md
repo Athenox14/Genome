@@ -12,14 +12,13 @@ required in production.
 This was built in a single autonomous session. The core is real and
 live-tested (not just compiled): git clone/push over HTTP and SSH, GitHub
 Actions-compatible CI running real Docker jobs, Coder-like containerized dev
-workspaces, GraphQL API, OAuth2 provider, package registry. See `JOURNAL.md`
-for the full build log and honest list of what is and isn't production-hardened.
+workspaces, GraphQL API, package registry. See `JOURNAL.md` for the full
+build log and honest list of what is and isn't production-hardened.
 
 **Known gaps** (see `JOURNAL.md` for detail): no artifact-of-repo-mirroring for
 existing repos' pre-receive hooks (only newly-created repos get the force-push
-protection hook), OAuth2-issued tokens aren't yet wired into the same
-`TokenLookup` auth path as PATs, no code-search/full-text search (only
-ILIKE-ish substring match), no rename-repo-on-disk.
+protection hook), no code-search/full-text search (only ILIKE-ish substring
+match), no rename-repo-on-disk.
 
 ## Architecture
 
@@ -36,7 +35,7 @@ Rust workspace, one crate per concern:
 | `dev-env` | Coder-like containerized dev workspaces (bollard/Docker), auto-stop scheduling |
 | `webhooks` | HMAC-signed webhook dispatch |
 | `graphql-api` | The GraphQL schema (async-graphql) wiring everything together |
-| `server` | axum binary: HTTP router (GraphQL, git smart-HTTP, OAuth2, packages, artifacts), spawns the SSH server and background loops (mirror sync, workspace auto-stop) |
+| `server` | axum binary: HTTP router (GraphQL, git smart-HTTP, packages, artifacts), spawns the SSH server and background loops (mirror sync, workspace auto-stop) |
 
 `frontend/` is an independent Nuxt 3 + Vue 3 app for browsing/testing against
 the GraphQL API — not required for production use.
@@ -109,7 +108,7 @@ curl -s localhost:8000/graphql -H "Authorization: Bearer $TOKEN" -H 'Content-Typ
 
 Auth & account: `register`, `login`, `addSshKey`, `removeSshKey`,
 `enableTwoFactor`, `confirmTwoFactor`, `disableTwoFactor`,
-`createAccessToken`, `revokeAccessToken`, `createOauth2Application`.
+`createAccessToken`, `revokeAccessToken`.
 
 Repos: `createRepository`, `updateRepository`, `deleteRepository`,
 `forkRepository`, `setRepoMirror`, `setRepoSecret`, `addCollaborator`,
@@ -150,9 +149,6 @@ Admin: `adminListUsers`, `adminSetUserAdmin`, `adminDeactivateUser`,
   registering a key via `addSshKey`.
 - `GET/PUT /packages/:owner/:name/:version` — package registry.
 - `GET /artifacts/:id/download` — CI artifact download.
-- `GET /oauth/authorize`, `POST /oauth/token` — OAuth2 provider for
-  third-party apps (not the same thing as logging in — this is Genome
-  *issuing* tokens to other apps).
 - `GET /health` — liveness probe.
 
 ## Testing
