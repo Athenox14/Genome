@@ -93,7 +93,11 @@ async fn exec_as(
 }
 
 fn unique(prefix: &str) -> String {
-    format!("{prefix}_{}", Uuid::new_v4().simple())
+    // Usernames/repo names are capped at 32 chars (see `validate_username`/
+    // `validate_slug`), so truncate the UUID suffix to fit even the longest
+    // prefix used in this file with room to spare.
+    let suffix = &Uuid::new_v4().simple().to_string()[..12];
+    format!("{prefix}{suffix}")
 }
 
 fn assert_no_errors(resp: &async_graphql::Response) {
