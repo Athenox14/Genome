@@ -30,6 +30,46 @@ struct ServerState {
     config: Config,
 }
 
+/// Resolves a hashed personal access token (`access_tokens` table) into the
+/// `Claims` of the user it belongs to, for `auth::extract_user_from_headers`.
+/// Expired tokens (`expires_at` in the past) are treated as invalid.
+struct DbTokenLookup {
+    db: DatabaseConnection,
+}
+
+#[async_trait::async_trait]
+impl auth::TokenLookup for DbTokenLookup {
+    async fn lookup(&self, token_hash: &str) -> Option<auth::Claims> {
+        let token = entity::prelude::AccessToken::find()
+            .filter(entity::access_token::Column::TokenHash.eq(token_hash))
+            .one(&self.db)
+            .await
+            .ok()??;
+
+        if let Some(expires_at) = token.expires_at {
+            if expires_at < chrono::Utc::now() {
+                return None;
+            }
+        }
+
+        let user = entity::prelude::User::find_by_id(token.user_id)
+            .one(&self.db)
+            .await
+            .ok()??;
+        if user.deactivated_at.is_some() {
+            return None;
+        }
+
+        Some(auth::Claims {
+            sub: user.id,
+            username: user.username,
+            is_admin: user.is_admin,
+            exp: usize::MAX,
+            iat: 0,
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // `check-push-protection` is not the HTTP server: it's a tiny CLI
@@ -190,7 +230,7 @@ async fn graphql_post_handler(
     axum::Json(gql_request): axum::Json<async_graphql::Request>,
 ) -> axum::Json<async_graphql::Response> {
     let user =
-        auth::extract_user_from_headers(&headers, &state.app_ctx.jwt_secret, None).await;
+        auth::extract_user_from_headers(&headers, &state.app_ctx.jwt_secret, Some(&DbTokenLookup { db: state.app_ctx.db.clone() })).await;
     let request_ctx = graphql_api::RequestContext { user };
     let request = gql_request.data(request_ctx);
     let response = state.schema.execute(request).await;
@@ -894,7 +934,7 @@ async fn download_artifact_handler(
         .await?
         .ok_or_else(|| ServerError::NotFound("repository not found".to_string()))?;
 
-    let user = auth::extract_user_from_headers(&headers, &state.app_ctx.jwt_secret, None).await;
+    let user = auth::extract_user_from_headers(&headers, &state.app_ctx.jwt_secret, Some(&DbTokenLookup { db: state.app_ctx.db.clone() })).await;
     let user_id = user.as_ref().map(|c| c.sub);
     let allowed = user_has_repo_read_access(&state.app_ctx.db, &repo, user_id).await?;
     if !allowed {
@@ -1088,7 +1128,7 @@ async fn oauth_authorize_handler(
         .cloned()
         .ok_or_else(|| ServerError::BadRequest("missing redirect_uri".to_string()))?;
 
-    let user = auth::extract_user_from_headers(&headers, &state.app_ctx.jwt_secret, None).await;
+    let user = auth::extract_user_from_headers(&headers, &state.app_ctx.jwt_secret, Some(&DbTokenLookup { db: state.app_ctx.db.clone() })).await;
 
     let Some(claims) = user else {
         let query = params
@@ -1235,7 +1275,7 @@ async fn package_upload_handler(
     AxumPath((owner, name, version)): AxumPath<(String, String, String)>,
     body: Bytes,
 ) -> ServerResult<Response> {
-    let claims = auth::extract_user_from_headers(&headers, &state.app_ctx.jwt_secret, None)
+    let claims = auth::extract_user_from_headers(&headers, &state.app_ctx.jwt_secret, Some(&DbTokenLookup { db: state.app_ctx.db.clone() }))
         .await
         .ok_or(ServerError::Unauthorized)?;
     if claims.username != owner {

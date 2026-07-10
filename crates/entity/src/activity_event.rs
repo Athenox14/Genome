@@ -46,5 +46,7 @@ pub mod kind {
     pub const ISSUE_OPENED: &str = "issue_opened";
     pub const PR_OPENED: &str = "pr_opened";
     pub const PR_MERGED: &str = "pr_merged";
+    pub const PR_CLOSED: &str = "pr_closed";
+    pub const ISSUE_CLOSED: &str = "issue_closed";
     pub const REPO_CREATED: &str = "repo_created";
 }

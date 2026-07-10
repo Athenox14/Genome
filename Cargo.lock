@@ -4423,6 +4423,7 @@ dependencies = [
  "anyhow",
  "async-graphql",
  "async-graphql-axum",
+ "async-trait",
  "auth",
  "axum 0.7.9",
  "bollard",

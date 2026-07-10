@@ -268,6 +268,17 @@ impl RepoManager {
         Ok(())
     }
 
+    /// Permanently delete a repository's wiki from disk, if it exists. Unlike
+    /// `delete_repo`, a missing wiki is not an error: not every repository
+    /// has one (wiki init is best-effort in `createRepository`).
+    pub fn delete_wiki(&self, owner: &str, name: &str) -> Result<()> {
+        let path = self.wiki_repo_path(owner, name);
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        Ok(())
+    }
+
     fn open(&self, owner: &str, name: &str) -> Result<(Repository, PathBuf)> {
         let path = self.repo_path(owner, name)?;
         if !path.exists() {

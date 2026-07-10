@@ -32,3 +32,4 @@ async-graphql = { workspace = true }
 futures-util = { workspace = true }
 bollard = { workspace = true }
 dashmap = { workspace = true }
+async-trait = "0.1"

@@ -274,6 +274,35 @@ impl RepositoryObject {
             .await?;
         Ok(projects.into_iter().map(ProjectObject::from).collect())
     }
+
+    /// Webhooks configured to receive events for this repository.
+    async fn webhooks(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<WebhookObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let hooks = entity::prelude::Webhook::find()
+            .filter(entity::webhook::Column::RepoId.eq(self.id))
+            .all(&app.db)
+            .await?;
+        Ok(hooks.into_iter().map(WebhookObject::from).collect())
+    }
+
+    /// Users granted explicit collaborator access to this repository.
+    async fn collaborators(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<CollaboratorObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let collabs = entity::prelude::RepoCollaborator::find()
+            .filter(entity::repo_collaborator::Column::RepoId.eq(self.id))
+            .all(&app.db)
+            .await?;
+        let mut out = Vec::with_capacity(collabs.len());
+        for c in collabs {
+            if let Some(user) = entity::prelude::User::find_by_id(c.user_id).one(&app.db).await? {
+                out.push(CollaboratorObject {
+                    user: UserObject::from(user),
+                    permission: c.permission,
+                });
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[derive(SimpleObject, Clone)]
@@ -899,6 +928,68 @@ impl ProjectCardObject {
         let issue = entity::prelude::Issue::find_by_id(iid).one(&app.db).await?;
         Ok(issue.map(IssueObject::from))
     }
+}
+
+/// A personal access token (PAT), usable as `Authorization: token <value>`
+/// against the GraphQL API, git smart-HTTP, and REST routes. The plaintext
+/// token itself is never stored (only its SHA256 hash) and is only ever
+/// exposed once, from `createAccessToken`.
+#[derive(SimpleObject, Clone)]
+pub struct AccessTokenObject {
+    pub id: Uuid,
+    pub name: String,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl From<entity::access_token::Model> for AccessTokenObject {
+    fn from(m: entity::access_token::Model) -> Self {
+        let scopes = serde_json::from_value(m.scopes).unwrap_or_default();
+        Self {
+            id: m.id,
+            name: m.name,
+            scopes,
+            expires_at: m.expires_at,
+        }
+    }
+}
+
+/// Returned once, at creation time, from `createAccessToken`. The plaintext
+/// `token` is never stored or retrievable again — only its hash is persisted.
+#[derive(SimpleObject, Clone)]
+pub struct AccessTokenCreated {
+    pub token: String,
+    pub access_token: AccessTokenObject,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct WebhookObject {
+    pub id: Uuid,
+    pub repo_id: Uuid,
+    pub target_url: String,
+    pub events: Vec<String>,
+    pub active: bool,
+}
+
+impl From<entity::webhook::Model> for WebhookObject {
+    fn from(m: entity::webhook::Model) -> Self {
+        let events = serde_json::from_value(m.events).unwrap_or_default();
+        Self {
+            id: m.id,
+            repo_id: m.repo_id,
+            target_url: m.target_url,
+            events,
+            active: m.active,
+        }
+    }
+}
+
+/// A repository collaborator: a user granted explicit access alongside
+/// (or instead of) organization/ownership-derived permission.
+#[derive(SimpleObject, Clone)]
+pub struct CollaboratorObject {
+    pub user: UserObject,
+    pub permission: String,
 }
 
 #[derive(SimpleObject, Clone)]

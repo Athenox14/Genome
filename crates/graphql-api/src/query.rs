@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::context::{AppContext, RequestContext};
 use crate::types::{
-    ActivityEventObject, DevWorkspaceObject, IssueObject, NotificationObject, OrganizationObject,
-    PackageObject, RepositoryObject, SearchResults, SshKeyObject, UserObject,
+    AccessTokenObject, ActivityEventObject, DevWorkspaceObject, IssueObject, NotificationObject,
+    OrganizationObject, PackageObject, RepositoryObject, SearchResults, SshKeyObject, UserObject,
 };
 
 pub struct QueryRoot;
@@ -168,6 +168,36 @@ impl QueryRoot {
             .all(&app.db)
             .await?;
         Ok(workspaces.into_iter().map(DevWorkspaceObject::from).collect())
+    }
+
+    /// Every dev workspace on the instance, regardless of owner. Restricted
+    /// to site admins.
+    async fn admin_all_dev_workspaces(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<DevWorkspaceObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let Some(claims) = &req.user else {
+            return Err(async_graphql::Error::new("unauthenticated"));
+        };
+        if !claims.is_admin {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+        let workspaces = entity::prelude::DevWorkspace::find().all(&app.db).await?;
+        Ok(workspaces.into_iter().map(DevWorkspaceObject::from).collect())
+    }
+
+    /// The current user's personal access tokens (metadata only; plaintext
+    /// token values are never retrievable after creation).
+    async fn my_access_tokens(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<AccessTokenObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let Some(claims) = &req.user else {
+            return Err(async_graphql::Error::new("unauthenticated"));
+        };
+        let tokens = entity::prelude::AccessToken::find()
+            .filter(entity::access_token::Column::UserId.eq(claims.sub))
+            .all(&app.db)
+            .await?;
+        Ok(tokens.into_iter().map(AccessTokenObject::from).collect())
     }
 
     /// Lists all users on the instance, paginated. Restricted to site admins.

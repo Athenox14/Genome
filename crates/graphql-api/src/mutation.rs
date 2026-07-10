@@ -2,17 +2,20 @@ use async_graphql::{Context, Object};
 use auth::{Claims, ClaimsInput, Permission};
 use chrono::Utc;
 use regex::Regex;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    sea_query::Expr, ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set,
+};
 use std::sync::OnceLock;
 use uuid::Uuid;
 
 use crate::context::{AppContext, RequestContext};
 use crate::types::{
-    resolve_owner_login, AuthPayload, BranchProtectionRuleObject, DevWorkspaceObject,
-    IssueCommentObject, IssueObject, LabelObject, MilestoneObject, NotificationObject,
-    OAuth2ApplicationCreated, OrganizationObject, PrReviewCommentObject, PrReviewObject,
-    ProjectCardObject, ProjectColumnObject, ProjectObject, PullRequestObject, RepositoryObject,
-    TwoFactorSetup, UserObject, WorkflowRunObject,
+    resolve_owner_login, AccessTokenCreated, AccessTokenObject, AuthPayload,
+    BranchProtectionRuleObject, DevWorkspaceObject, IssueCommentObject, IssueObject, LabelObject,
+    MilestoneObject, NotificationObject, OAuth2ApplicationCreated, OrganizationObject,
+    PrReviewCommentObject, PrReviewObject, ProjectCardObject, ProjectColumnObject, ProjectObject,
+    PullRequestObject, RepositoryObject, TwoFactorSetup, UserObject, WebhookObject,
+    WorkflowRunObject,
 };
 
 const TOTP_ISSUER: &str = "Genome";
@@ -154,6 +157,22 @@ async fn repo_permission(
         collaborator_perm,
         repo.is_private,
     ))
+}
+
+/// Errors unless the given user is an owner or admin of the organization
+/// (used to gate org membership management mutations).
+async fn require_org_admin(app: &AppContext, org_id: Uuid, user_id: Uuid) -> async_graphql::Result<()> {
+    let is_admin = entity::prelude::OrgMember::find()
+        .filter(entity::org_member::Column::OrgId.eq(org_id))
+        .filter(entity::org_member::Column::UserId.eq(user_id))
+        .one(&app.db)
+        .await?
+        .map(|m| m.role == entity::org_member::role::OWNER || m.role == entity::org_member::role::ADMIN)
+        .unwrap_or(false);
+    if !is_admin {
+        return Err(async_graphql::Error::new("forbidden"));
+    }
+    Ok(())
 }
 
 async fn find_repo(app: &AppContext, repo_id: Uuid) -> async_graphql::Result<entity::repository::Model> {
@@ -511,12 +530,50 @@ impl MutationRoot {
             .await
             .unwrap_or_default();
         let _ = app.repo_manager.delete_repo(&owner_login, &repo.name);
+        let _ = app.repo_manager.delete_wiki(&owner_login, &repo.name);
 
         entity::prelude::Repository::delete_by_id(repo.id)
             .exec(&app.db)
             .await?;
 
         Ok(true)
+    }
+
+    /// Updates a repository's mutable metadata (description, visibility,
+    /// default branch). Requires Admin permission on the repository. Does
+    /// not rename the repository on disk; renaming is not currently
+    /// supported.
+    async fn update_repository(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        description: Option<String>,
+        is_private: Option<bool>,
+        default_branch: Option<String>,
+    ) -> async_graphql::Result<RepositoryObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let repo = find_repo(app, repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm != Some(Permission::Admin) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let mut active: entity::repository::ActiveModel = repo.into();
+        if let Some(description) = description {
+            active.description = Set(Some(description));
+        }
+        if let Some(is_private) = is_private {
+            active.is_private = Set(is_private);
+        }
+        if let Some(default_branch) = default_branch {
+            active.default_branch = Set(default_branch);
+        }
+        let repo = active.update(&app.db).await?;
+
+        Ok(RepositoryObject::from_model(&app.db, repo).await)
     }
 
     /// Forks a repository into a new repository owned by the current user,
@@ -643,6 +700,77 @@ impl MutationRoot {
             format!("{} opened issue #{} on {}", claims.username, issue.number, repo.name),
         )
         .await;
+
+        Ok(IssueObject::from(issue))
+    }
+
+    /// Updates an issue's title/body, and/or opens or closes it via `state`
+    /// (one of `"open"`/`"closed"`). Requires at least Write permission on
+    /// the parent repository.
+    async fn update_issue(
+        &self,
+        ctx: &Context<'_>,
+        issue_id: Uuid,
+        title: Option<String>,
+        body: Option<String>,
+        state: Option<String>,
+    ) -> async_graphql::Result<IssueObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let issue = entity::prelude::Issue::find_by_id(issue_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("issue not found"))?;
+        let repo = find_repo(app, issue.repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm < Some(Permission::Write) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        if let Some(state) = &state {
+            let valid_states = [entity::issue::state::OPEN, entity::issue::state::CLOSED];
+            if !valid_states.contains(&state.as_str()) {
+                return Err(async_graphql::Error::new(format!(
+                    "invalid issue state '{state}'; expected one of {valid_states:?}"
+                )));
+            }
+        }
+
+        let was_open = issue.state == entity::issue::state::OPEN;
+        let mut active: entity::issue::ActiveModel = issue.into();
+        if let Some(title) = title {
+            active.title = Set(title);
+        }
+        if let Some(body) = body {
+            active.body = Set(Some(body));
+        }
+        if let Some(state) = state {
+            let now_closed = state == entity::issue::state::CLOSED;
+            active.closed_at = Set(if now_closed { Some(Utc::now()) } else { None });
+            active.state = Set(state);
+        }
+        let issue = active.update(&app.db).await?;
+
+        let action = if issue.state == entity::issue::state::CLOSED && was_open {
+            "closed"
+        } else if issue.state == entity::issue::state::OPEN && !was_open {
+            "reopened"
+        } else {
+            "edited"
+        };
+        let payload = serde_json::json!({
+            "action": action,
+            "issue": {
+                "id": issue.id,
+                "number": issue.number,
+                "title": issue.title,
+                "state": issue.state,
+            },
+            "repository": { "id": repo.id, "name": repo.name },
+        });
+        let _ = app.webhook_dispatcher.dispatch(repo.id, "issues", payload).await;
 
         Ok(IssueObject::from(issue))
     }
@@ -923,6 +1051,62 @@ impl MutationRoot {
         Ok(PullRequestObject::from(pr))
     }
 
+    /// Closes a pull request without merging it. Requires at least Write
+    /// permission on the repository. No-op error if the PR is already
+    /// merged or closed.
+    async fn close_pull_request(&self, ctx: &Context<'_>, pr_id: Uuid) -> async_graphql::Result<PullRequestObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let pr = entity::prelude::PullRequest::find_by_id(pr_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("pull request not found"))?;
+        let repo = find_repo(app, pr.repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm < Some(Permission::Write) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+        if pr.state != entity::pull_request::state::OPEN {
+            return Err(async_graphql::Error::new(format!(
+                "cannot close pull request in state '{}'",
+                pr.state
+            )));
+        }
+
+        let mut active: entity::pull_request::ActiveModel = pr.into();
+        active.state = Set(entity::pull_request::state::CLOSED.to_string());
+        let pr = active.update(&app.db).await?;
+
+        let payload = serde_json::json!({
+            "action": "closed",
+            "pull_request": {
+                "id": pr.id,
+                "number": pr.number,
+                "title": pr.title,
+                "state": pr.state,
+                "merged": false,
+            },
+            "repository": { "id": repo.id, "name": repo.name },
+        });
+        let _ = app
+            .webhook_dispatcher
+            .dispatch(repo.id, "pull_request", payload)
+            .await;
+
+        record_activity(
+            app,
+            Some(repo.id),
+            claims.sub,
+            entity::activity_event::kind::PR_CLOSED,
+            format!("{} closed pull request #{} on {}", claims.username, pr.number, repo.name),
+        )
+        .await;
+
+        Ok(PullRequestObject::from(pr))
+    }
+
     /// Creates or updates a wiki page (`{page}.md`) for a repository,
     /// committing the change on the wiki repo's default branch. Requires
     /// at least Write permission on the parent repository.
@@ -1121,6 +1305,137 @@ impl MutationRoot {
         Ok(OrganizationObject::from(org))
     }
 
+    /// Adds an existing user to an organization with the given role
+    /// (`owner`/`admin`/`member`). Requires the caller to be an owner or
+    /// admin of the organization.
+    async fn add_org_member(
+        &self,
+        ctx: &Context<'_>,
+        org_id: Uuid,
+        username: String,
+        role: String,
+    ) -> async_graphql::Result<bool> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+        require_org_admin(app, org_id, claims.sub).await?;
+
+        let valid_roles = [
+            entity::org_member::role::OWNER,
+            entity::org_member::role::ADMIN,
+            entity::org_member::role::MEMBER,
+        ];
+        if !valid_roles.contains(&role.as_str()) {
+            return Err(async_graphql::Error::new(format!(
+                "invalid role '{role}'; expected one of {valid_roles:?}"
+            )));
+        }
+
+        let user = entity::prelude::User::find()
+            .filter(entity::user::Column::Username.eq(username))
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("user not found"))?;
+
+        let member = entity::org_member::ActiveModel {
+            org_id: Set(org_id),
+            user_id: Set(user.id),
+            role: Set(role),
+        };
+        member.insert(&app.db).await?;
+        Ok(true)
+    }
+
+    /// Changes an existing organization member's role. Requires the caller
+    /// to be an owner or admin of the organization.
+    async fn update_org_member_role(
+        &self,
+        ctx: &Context<'_>,
+        org_id: Uuid,
+        user_id: Uuid,
+        role: String,
+    ) -> async_graphql::Result<bool> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+        require_org_admin(app, org_id, claims.sub).await?;
+
+        let valid_roles = [
+            entity::org_member::role::OWNER,
+            entity::org_member::role::ADMIN,
+            entity::org_member::role::MEMBER,
+        ];
+        if !valid_roles.contains(&role.as_str()) {
+            return Err(async_graphql::Error::new(format!(
+                "invalid role '{role}'; expected one of {valid_roles:?}"
+            )));
+        }
+
+        let member = entity::prelude::OrgMember::find()
+            .filter(entity::org_member::Column::OrgId.eq(org_id))
+            .filter(entity::org_member::Column::UserId.eq(user_id))
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("member not found"))?;
+
+        let mut active: entity::org_member::ActiveModel = member.into();
+        active.role = Set(role);
+        active.update(&app.db).await?;
+        Ok(true)
+    }
+
+    /// Removes a member from an organization. Requires the caller to be an
+    /// owner or admin of the organization.
+    async fn remove_org_member(
+        &self,
+        ctx: &Context<'_>,
+        org_id: Uuid,
+        user_id: Uuid,
+    ) -> async_graphql::Result<bool> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+        require_org_admin(app, org_id, claims.sub).await?;
+
+        let res = entity::prelude::OrgMember::delete_many()
+            .filter(entity::org_member::Column::OrgId.eq(org_id))
+            .filter(entity::org_member::Column::UserId.eq(user_id))
+            .exec(&app.db)
+            .await?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// Deletes an organization (and, via foreign-key cascade at the DB
+    /// level if configured, its memberships). Note this does *not* delete
+    /// repositories owned by the organization; those remain with a dangling
+    /// `owner_id` and should be reassigned or deleted first. Requires the
+    /// caller to be an owner of the organization.
+    async fn delete_organization(&self, ctx: &Context<'_>, org_id: Uuid) -> async_graphql::Result<bool> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let is_owner = entity::prelude::OrgMember::find()
+            .filter(entity::org_member::Column::OrgId.eq(org_id))
+            .filter(entity::org_member::Column::UserId.eq(claims.sub))
+            .one(&app.db)
+            .await?
+            .map(|m| m.role == entity::org_member::role::OWNER)
+            .unwrap_or(false);
+        if !is_owner {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        entity::prelude::OrgMember::delete_many()
+            .filter(entity::org_member::Column::OrgId.eq(org_id))
+            .exec(&app.db)
+            .await?;
+        entity::prelude::Organization::delete_by_id(org_id)
+            .exec(&app.db)
+            .await?;
+        Ok(true)
+    }
+
     async fn add_collaborator(
         &self,
         ctx: &Context<'_>,
@@ -1152,6 +1467,33 @@ impl MutationRoot {
         collab.insert(&app.db).await?;
 
         Ok(true)
+    }
+
+    /// Removes a collaborator's explicit access grant from a repository.
+    /// Requires Admin permission. Does not affect access derived from
+    /// ownership or organization role.
+    async fn remove_collaborator(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        user_id: Uuid,
+    ) -> async_graphql::Result<bool> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let repo = find_repo(app, repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm != Some(Permission::Admin) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let res = entity::prelude::RepoCollaborator::delete_many()
+            .filter(entity::repo_collaborator::Column::RepoId.eq(repo_id))
+            .filter(entity::repo_collaborator::Column::UserId.eq(user_id))
+            .exec(&app.db)
+            .await?;
+        Ok(res.rows_affected > 0)
     }
 
     /// Loads a workflow definition from the repository's default branch,
@@ -1823,5 +2165,249 @@ impl MutationRoot {
             client_id,
             client_secret,
         })
+    }
+
+    // ---- Personal access tokens ----
+
+    /// Creates a new personal access token (PAT) for the current user,
+    /// usable as `Authorization: token <value>` against the GraphQL API,
+    /// git smart-HTTP, and REST routes (an alternative to logging in and
+    /// getting a short-lived JWT — the primary auth mechanism for
+    /// API-only/automation use). The plaintext `token` is returned exactly
+    /// once; only its SHA256 hash is persisted.
+    async fn create_access_token(
+        &self,
+        ctx: &Context<'_>,
+        name: String,
+        #[graphql(default)] scopes: Vec<String>,
+        expires_in_days: Option<i64>,
+    ) -> async_graphql::Result<AccessTokenCreated> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let (token, token_hash) = auth::generate_access_token();
+        let expires_at = expires_in_days.map(|days| Utc::now() + chrono::Duration::days(days));
+
+        let row = entity::access_token::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            user_id: Set(claims.sub),
+            token_hash: Set(token_hash),
+            name: Set(name),
+            scopes: Set(serde_json::to_value(&scopes).unwrap_or(serde_json::Value::Array(vec![]))),
+            expires_at: Set(expires_at),
+        };
+        let row = row.insert(&app.db).await?;
+
+        Ok(AccessTokenCreated {
+            token,
+            access_token: AccessTokenObject::from(row),
+        })
+    }
+
+    /// Revokes (deletes) one of the current user's personal access tokens.
+    async fn revoke_access_token(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<bool> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let res = entity::prelude::AccessToken::delete_many()
+            .filter(entity::access_token::Column::Id.eq(id))
+            .filter(entity::access_token::Column::UserId.eq(claims.sub))
+            .exec(&app.db)
+            .await?;
+        Ok(res.rows_affected > 0)
+    }
+
+    // ---- Webhooks ----
+
+    /// Registers a webhook: `target_url` receives a signed POST for each
+    /// event in `events` (e.g. `"issues"`, `"pull_request"`, `"push"`,
+    /// `"issue_comment"`) that occurs on the repository. `secret` is used by
+    /// the receiver to verify the payload signature (see the `webhooks`
+    /// crate's dispatcher). Requires Admin permission on the repository.
+    async fn create_webhook(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        target_url: String,
+        secret: String,
+        events: Vec<String>,
+    ) -> async_graphql::Result<WebhookObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let repo = find_repo(app, repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm != Some(Permission::Admin) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let webhook = entity::webhook::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            repo_id: Set(repo_id),
+            target_url: Set(target_url),
+            secret: Set(secret),
+            events: Set(serde_json::to_value(&events).unwrap_or(serde_json::Value::Array(vec![]))),
+            active: Set(true),
+        };
+        let webhook = webhook.insert(&app.db).await?;
+        Ok(WebhookObject::from(webhook))
+    }
+
+    /// Updates a webhook's target URL, subscribed events, and/or
+    /// active/inactive status. Requires Admin permission on the repository.
+    async fn update_webhook(
+        &self,
+        ctx: &Context<'_>,
+        webhook_id: Uuid,
+        target_url: Option<String>,
+        events: Option<Vec<String>>,
+        active: Option<bool>,
+    ) -> async_graphql::Result<WebhookObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let webhook = entity::prelude::Webhook::find_by_id(webhook_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("webhook not found"))?;
+        let repo = find_repo(app, webhook.repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm != Some(Permission::Admin) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let mut active_model: entity::webhook::ActiveModel = webhook.into();
+        if let Some(target_url) = target_url {
+            active_model.target_url = Set(target_url);
+        }
+        if let Some(events) = events {
+            active_model.events =
+                Set(serde_json::to_value(&events).unwrap_or(serde_json::Value::Array(vec![])));
+        }
+        if let Some(active) = active {
+            active_model.active = Set(active);
+        }
+        let webhook = active_model.update(&app.db).await?;
+        Ok(WebhookObject::from(webhook))
+    }
+
+    /// Deletes a webhook. Requires Admin permission on the repository.
+    async fn delete_webhook(&self, ctx: &Context<'_>, webhook_id: Uuid) -> async_graphql::Result<bool> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let webhook = entity::prelude::Webhook::find_by_id(webhook_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("webhook not found"))?;
+        let repo = find_repo(app, webhook.repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm != Some(Permission::Admin) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        entity::prelude::Webhook::delete_by_id(webhook_id)
+            .exec(&app.db)
+            .await?;
+        Ok(true)
+    }
+
+    // ---- Label / milestone deletion ----
+
+    /// Deletes a label from a repository (also removing it from any issues
+    /// it was attached to, via the `issue_labels` join rows). Requires at
+    /// least Write permission on the repository.
+    async fn delete_label(&self, ctx: &Context<'_>, label_id: Uuid) -> async_graphql::Result<bool> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let label = entity::prelude::Label::find_by_id(label_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("label not found"))?;
+        let repo = find_repo(app, label.repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm < Some(Permission::Write) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        entity::prelude::IssueLabel::delete_many()
+            .filter(entity::issue_label::Column::LabelId.eq(label_id))
+            .exec(&app.db)
+            .await?;
+        entity::prelude::Label::delete_by_id(label_id)
+            .exec(&app.db)
+            .await?;
+        Ok(true)
+    }
+
+    /// Deletes a milestone from a repository, unassigning it from any
+    /// issues that referenced it. Requires at least Write permission on
+    /// the repository.
+    async fn delete_milestone(&self, ctx: &Context<'_>, milestone_id: Uuid) -> async_graphql::Result<bool> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let milestone = entity::prelude::Milestone::find_by_id(milestone_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("milestone not found"))?;
+        let repo = find_repo(app, milestone.repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm < Some(Permission::Write) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        entity::prelude::Issue::update_many()
+            .col_expr(entity::issue::Column::MilestoneId, Expr::value(None::<Uuid>))
+            .filter(entity::issue::Column::MilestoneId.eq(milestone_id))
+            .exec(&app.db)
+            .await?;
+        entity::prelude::Milestone::delete_by_id(milestone_id)
+            .exec(&app.db)
+            .await?;
+        Ok(true)
+    }
+
+    // ---- Dev workspaces: admin/exec ----
+
+    /// Executes a one-off command inside a running dev workspace container
+    /// and returns its combined stdout/stderr. Restricted to the
+    /// workspace's owner (or a site admin).
+    async fn exec_in_dev_workspace(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        command: Vec<String>,
+    ) -> async_graphql::Result<String> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let workspace = entity::prelude::DevWorkspace::find_by_id(workspace_id)
+            .one(&app.db)
+            .await?
+            .ok_or_else(|| async_graphql::Error::new("workspace not found"))?;
+        if workspace.owner_id != claims.sub && !claims.is_admin {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+        let container_id = workspace
+            .container_id
+            .clone()
+            .ok_or_else(|| async_graphql::Error::new("workspace has no container"))?;
+
+        let output = app
+            .workspace_manager
+            .exec_command(&container_id, command)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(output)
     }
 }
