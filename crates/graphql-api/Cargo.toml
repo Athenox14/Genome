@@ -11,6 +11,7 @@ git-core = { path = "../git-core" }
 auth = { path = "../auth" }
 actions = { path = "../actions" }
 dev-env = { path = "../dev-env" }
+webhooks = { path = "../webhooks" }
 
 async-graphql = { workspace = true }
 async-graphql-axum = { workspace = true }

@@ -1395,6 +1395,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "webhooks",
 ]
 
 [[package]]
@@ -3317,6 +3318,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "webhooks",
 ]
 
 [[package]]
@@ -4429,6 +4431,25 @@ checksum = "8622dcb61c0bcc9fffa6938bed81210af2da9a7e4a1a834b2e37a59b6dfb6141"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webhooks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "entity",
+ "hex",
+ "hmac",
+ "reqwest",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

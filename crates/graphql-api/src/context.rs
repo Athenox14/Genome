@@ -10,6 +10,7 @@ pub struct AppContext {
     pub jwt_secret: String,
     pub actions_executor: Arc<actions::Executor>,
     pub workspace_manager: Arc<dev_env::WorkspaceManager>,
+    pub webhook_dispatcher: Arc<webhooks::WebhookDispatcher>,
 }
 
 /// Per-request context, holding the authenticated user's claims (if any).

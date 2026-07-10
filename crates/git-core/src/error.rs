@@ -38,6 +38,9 @@ pub enum GitCoreError {
 
     #[error("utf8 conversion error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
+
+    #[error("merge conflict between '{0}' and '{1}': cannot merge automatically")]
+    MergeConflict(String, String),
 }
 
 pub type Result<T> = std::result::Result<T, GitCoreError>;

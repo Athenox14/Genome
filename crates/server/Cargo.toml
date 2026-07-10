@@ -12,6 +12,7 @@ auth = { path = "../auth" }
 actions = { path = "../actions" }
 dev-env = { path = "../dev-env" }
 graphql-api = { path = "../graphql-api" }
+webhooks = { path = "../webhooks" }
 
 axum = { workspace = true }
 tokio = { workspace = true }

@@ -285,6 +285,81 @@ impl RepoManager {
         Ok(data)
     }
 
+    /// Merge `source_branch` into `target_branch`. If the target is already
+    /// up-to-date with the source, this is a no-op and returns the target's
+    /// current commit sha. If a fast-forward is possible, the target branch
+    /// ref is simply moved to the source's commit. Otherwise a real merge
+    /// commit is created with both branch tips as parents. Returns the sha
+    /// of the resulting commit (as hex string).
+    #[allow(clippy::too_many_arguments)]
+    pub fn merge_branches(
+        &self,
+        owner: &str,
+        name: &str,
+        source_branch: &str,
+        target_branch: &str,
+        author_name: &str,
+        author_email: &str,
+        message: &str,
+    ) -> Result<String> {
+        let (repo, _) = self.open(owner, name)?;
+
+        let source_commit = self.resolve_commit(&repo, source_branch)?;
+        let target_commit = self.resolve_commit(&repo, target_branch)?;
+
+        let target_ref_name = format!("refs/heads/{target_branch}");
+
+        // `merge_analysis` operates against the repo's current HEAD, which
+        // isn't necessarily `target_branch`, so determine fast-forward /
+        // up-to-date status directly via ancestry checks instead.
+        if source_commit.id() == target_commit.id()
+            || repo.graph_descendant_of(target_commit.id(), source_commit.id())?
+        {
+            // Target already contains source's history: no-op.
+            return Ok(target_commit.id().to_string());
+        }
+
+        if repo.graph_descendant_of(source_commit.id(), target_commit.id())? {
+            // Source is strictly ahead of target: fast-forward.
+            let mut target_ref = repo.find_reference(&target_ref_name)?;
+            target_ref.set_target(source_commit.id(), "fast-forward merge")?;
+            return Ok(source_commit.id().to_string());
+        }
+
+        // Real merge commit.
+        let base_oid = repo.merge_base(target_commit.id(), source_commit.id())?;
+        let base_commit = repo.find_commit(base_oid)?;
+
+        let ancestor_tree = base_commit.tree()?;
+        let target_tree = target_commit.tree()?;
+        let source_tree = source_commit.tree()?;
+
+        let mut index = repo.merge_trees(&ancestor_tree, &target_tree, &source_tree, None)?;
+
+        if index.has_conflicts() {
+            return Err(GitCoreError::MergeConflict(
+                source_branch.to_string(),
+                target_branch.to_string(),
+            ));
+        }
+
+        let tree_oid = index.write_tree_to(&repo)?;
+        let tree = repo.find_tree(tree_oid)?;
+
+        let signature = git2::Signature::now(author_name, author_email)?;
+
+        let commit_oid = repo.commit(
+            Some(&target_ref_name),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&target_commit, &source_commit],
+        )?;
+
+        Ok(commit_oid.to_string())
+    }
+
     /// Recursively walk `tree`, appending every blob it (transitively)
     /// contains to `builder` as a tar entry under `prefix`.
     fn write_tree_to_tar(
@@ -390,5 +465,142 @@ mod tests {
             }
         }
         assert!(found, "expected hello.txt entry in tar archive");
+    }
+
+    /// Commit a single file with given content on top of `parent_oid` (or
+    /// as a root commit if `parent_oid` is `None`), updating the given ref.
+    fn commit_file(
+        repo: &Repository,
+        ref_name: &str,
+        parent_oid: Option<git2::Oid>,
+        file_name: &str,
+        content: &[u8],
+    ) -> git2::Oid {
+        let mut index = git2::Index::new().expect("new index");
+        if let Some(parent) = parent_oid {
+            let parent_commit = repo.find_commit(parent).expect("find parent");
+            index
+                .read_tree(&parent_commit.tree().expect("parent tree"))
+                .expect("read tree into index");
+        }
+        let blob_oid = repo.blob(content).expect("write blob");
+        index
+            .add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                file_size: content.len() as u32,
+                id: blob_oid,
+                flags: 0,
+                flags_extended: 0,
+                path: file_name.as_bytes().to_vec(),
+            })
+            .expect("add index entry");
+        let tree_oid = index.write_tree_to(repo).expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let sig = git2::Signature::now("Test", "test@example.com").expect("signature");
+        let parents: Vec<git2::Commit> = parent_oid
+            .map(|oid| vec![repo.find_commit(oid).expect("find parent")])
+            .unwrap_or_default();
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(Some(ref_name), &sig, &sig, "commit", &tree, &parent_refs)
+            .expect("commit")
+    }
+
+    #[test]
+    fn merge_branches_fast_forwards_when_possible() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = RepoManager::new(dir.path());
+        manager.init_repo("acme", "widgets").expect("init repo");
+        let repo_path = manager.repo_path("acme", "widgets").expect("repo path");
+        let repo = Repository::open_bare(&repo_path).expect("open bare repo");
+
+        let base_oid = commit_file(&repo, "refs/heads/main", None, "a.txt", b"base\n");
+        repo.reference("refs/heads/feature", base_oid, false, "create feature")
+            .expect("create feature branch");
+
+        let feature_oid = commit_file(
+            &repo,
+            "refs/heads/feature",
+            Some(base_oid),
+            "b.txt",
+            b"feature change\n",
+        );
+
+        let result_sha = manager
+            .merge_branches(
+                "acme",
+                "widgets",
+                "feature",
+                "main",
+                "Merger",
+                "merger@example.com",
+                "Merge feature into main",
+            )
+            .expect("merge branches");
+
+        assert_eq!(result_sha, feature_oid.to_string());
+
+        let main_ref = repo
+            .find_reference("refs/heads/main")
+            .expect("find main ref");
+        assert_eq!(main_ref.target().expect("target"), feature_oid);
+    }
+
+    #[test]
+    fn merge_branches_creates_merge_commit_when_diverged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = RepoManager::new(dir.path());
+        manager.init_repo("acme", "widgets").expect("init repo");
+        let repo_path = manager.repo_path("acme", "widgets").expect("repo path");
+        let repo = Repository::open_bare(&repo_path).expect("open bare repo");
+
+        let base_oid = commit_file(&repo, "refs/heads/main", None, "a.txt", b"base\n");
+        repo.reference("refs/heads/feature", base_oid, false, "create feature")
+            .expect("create feature branch");
+
+        // Diverge: commit on main and a different commit on feature.
+        let main_oid = commit_file(
+            &repo,
+            "refs/heads/main",
+            Some(base_oid),
+            "main-only.txt",
+            b"main change\n",
+        );
+        let feature_oid = commit_file(
+            &repo,
+            "refs/heads/feature",
+            Some(base_oid),
+            "feature-only.txt",
+            b"feature change\n",
+        );
+
+        let result_sha = manager
+            .merge_branches(
+                "acme",
+                "widgets",
+                "feature",
+                "main",
+                "Merger",
+                "merger@example.com",
+                "Merge feature into main",
+            )
+            .expect("merge branches");
+
+        let merge_commit = repo
+            .find_commit(git2::Oid::from_str(&result_sha).expect("parse oid"))
+            .expect("find merge commit");
+        assert_eq!(merge_commit.parent_count(), 2);
+        assert_eq!(merge_commit.parent_id(0).expect("parent0"), main_oid);
+        assert_eq!(merge_commit.parent_id(1).expect("parent1"), feature_oid);
+
+        let main_ref = repo
+            .find_reference("refs/heads/main")
+            .expect("find main ref");
+        assert_eq!(main_ref.target().expect("target"), merge_commit.id());
     }
 }

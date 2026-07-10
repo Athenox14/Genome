@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
     let repo_manager = Arc::new(git_core::RepoManager::new(config.repos_root_path.clone()));
     let actions_executor = Arc::new(actions::Executor::new()?);
     let workspace_manager = Arc::new(dev_env::WorkspaceManager::connect_local()?);
+    let webhook_dispatcher = Arc::new(webhooks::WebhookDispatcher::new(db.clone()));
 
     let app_ctx = AppContext {
         db: db.clone(),
@@ -47,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         jwt_secret: config.jwt_secret.clone(),
         actions_executor: actions_executor.clone(),
         workspace_manager: workspace_manager.clone(),
+        webhook_dispatcher: webhook_dispatcher.clone(),
     };
 
     let schema = graphql_api::build_schema(app_ctx.clone());
@@ -244,11 +246,22 @@ async fn process_push_workflows(
         return Ok(());
     };
 
-    for (ref_name, _old_sha, new_sha) in changes {
+    for (ref_name, old_sha, new_sha) in changes {
         if new_sha == ZERO_SHA {
             // Branch deletion: nothing to run.
             continue;
         }
+
+        let push_payload = serde_json::json!({
+            "ref": ref_name,
+            "before": old_sha,
+            "after": new_sha,
+        });
+        let _ = app_ctx
+            .webhook_dispatcher
+            .dispatch(repo_row.id, "push", push_payload)
+            .await;
+
         let Some(branch) = ref_name.strip_prefix("refs/heads/") else {
             continue;
         };

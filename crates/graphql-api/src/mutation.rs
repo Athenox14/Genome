@@ -212,6 +212,20 @@ impl MutationRoot {
             closed_at: Set(None),
         };
         let issue = issue.insert(&app.db).await?;
+
+        let payload = serde_json::json!({
+            "action": "opened",
+            "issue": {
+                "id": issue.id,
+                "number": issue.number,
+                "title": issue.title,
+                "body": issue.body,
+                "state": issue.state,
+            },
+            "repository": { "id": repo.id, "name": repo.name },
+        });
+        let _ = app.webhook_dispatcher.dispatch(repo_id, "issues", payload).await;
+
         Ok(IssueObject::from(issue))
     }
 
@@ -243,6 +257,18 @@ impl MutationRoot {
             created_at: Set(Utc::now()),
         };
         let comment = comment.insert(&app.db).await?;
+
+        let payload = serde_json::json!({
+            "action": "created",
+            "issue": { "id": issue.id, "number": issue.number, "title": issue.title },
+            "comment": { "id": comment.id, "body": comment.body },
+            "repository": { "id": repo.id, "name": repo.name },
+        });
+        let _ = app
+            .webhook_dispatcher
+            .dispatch(repo.id, "issue_comment", payload)
+            .await;
+
         Ok(IssueCommentObject::from(comment))
     }
 
@@ -285,13 +311,31 @@ impl MutationRoot {
             merged_at: Set(None),
         };
         let pr = pr.insert(&app.db).await?;
+
+        let payload = serde_json::json!({
+            "action": "opened",
+            "pull_request": {
+                "id": pr.id,
+                "number": pr.number,
+                "title": pr.title,
+                "body": pr.body,
+                "state": pr.state,
+                "source_branch": pr.source_branch,
+                "target_branch": pr.target_branch,
+            },
+            "repository": { "id": repo.id, "name": repo.name },
+        });
+        let _ = app
+            .webhook_dispatcher
+            .dispatch(repo_id, "pull_request", payload)
+            .await;
+
         Ok(PullRequestObject::from(pr))
     }
 
-    /// Merges a pull request. NOTE: this does not currently perform an actual
-    /// git merge of the branches (git-core has no merge helper yet) - it only
-    /// marks the PR as merged in the database. A real merge / fast-forward
-    /// implementation should be added to git-core and wired in here.
+    /// Merges a pull request: performs an actual git merge (fast-forward or
+    /// merge commit) of `source_branch` into `target_branch` via git-core,
+    /// then marks the PR as merged in the database.
     async fn merge_pull_request(&self, ctx: &Context<'_>, pr_id: Uuid) -> async_graphql::Result<PullRequestObject> {
         let app = ctx.data::<AppContext>()?;
         let req = ctx.data::<RequestContext>()?;
@@ -307,10 +351,56 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
+        let owner_login = resolve_owner_login(&app.db, &repo.owner_type, repo.owner_id)
+            .await
+            .unwrap_or_default();
+
+        let message = format!(
+            "Merge pull request #{} from {}",
+            pr.number, pr.source_branch
+        );
+
+        let author_email = format!("{}@users.noreply.local", claims.username);
+
+        match app.repo_manager.merge_branches(
+            &owner_login,
+            &repo.name,
+            &pr.source_branch,
+            &pr.target_branch,
+            &claims.username,
+            &author_email,
+            &message,
+        ) {
+            Ok(_) => {}
+            Err(git_core::GitCoreError::MergeConflict(_, _)) => {
+                return Err(async_graphql::Error::new(
+                    "merge conflict, cannot merge automatically",
+                ));
+            }
+            Err(e) => return Err(async_graphql::Error::new(e.to_string())),
+        }
+
         let mut active: entity::pull_request::ActiveModel = pr.into();
         active.state = Set(entity::pull_request::state::MERGED.to_string());
         active.merged_at = Set(Some(Utc::now()));
         let pr = active.update(&app.db).await?;
+
+        let payload = serde_json::json!({
+            "action": "closed",
+            "pull_request": {
+                "id": pr.id,
+                "number": pr.number,
+                "title": pr.title,
+                "state": pr.state,
+                "merged": true,
+            },
+            "repository": { "id": repo.id, "name": repo.name },
+        });
+        let _ = app
+            .webhook_dispatcher
+            .dispatch(repo.id, "pull_request", payload)
+            .await;
+
         Ok(PullRequestObject::from(pr))
     }
 
