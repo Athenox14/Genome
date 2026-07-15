@@ -88,11 +88,58 @@ Since this is meant to run **API-only**, omit `frontend`:
 | `SSH_HOST_KEY_PATH` | `./data/ssh_host_key` | Persisted SSH host key (generated on first run) |
 | `HIQLITE_API_ADDR` | `127.0.0.1:8200` | Embedded DB node's internal API address |
 | `HIQLITE_RAFT_ADDR` | `127.0.0.1:8100` | Embedded DB node's internal Raft address |
-| `DOCKER_SOCKET_PATH` | platform default | Docker socket for Actions job execution + dev workspaces |
+| `DOCKER_SOCKET_PATH` | platform default | Docker (or Docker-API-compatible) socket for Actions job execution + dev workspaces — see §2a |
 | `SECRETS_ENCRYPTION_KEY` | *(unset)* | 32-byte base64 key for encrypting Actions secrets (`setRepoSecret`); required for that feature only |
 | `PACKAGES_ROOT_PATH` | `{repos_root_path}/../packages` | Package registry storage |
 | `FRONTEND_URL` | `http://localhost:3000` | Used for any redirect targets referencing the frontend |
 | `ADMIN_BOOTSTRAP_TOKEN` | *(unset)* | See §3 — pure-API bootstrap credential |
+
+### 2a. Container isolation (avoiding a privileged host Docker socket)
+
+CI job execution (`actions::Executor`) and dev workspaces (`dev_env::WorkspaceManager`)
+both work by talking to a Docker Engine API over a socket — the shipped
+`docker-compose.yml` does this by bind-mounting the **host's own**
+`/var/run/docker.sock` into the `server` container ("Docker outside of
+Docker", not Docker-in-Docker/DinD — there's no nested `dockerd` — but the
+practical risk is the same shape: anything that can reach that socket has
+root-equivalent control of the *host*, since it can start a container with
+`-v /:/host` and chroot into it). This is the simplest thing that works,
+but it's the single biggest privilege-escalation surface in a default
+deployment.
+
+`DOCKER_SOCKET_PATH` is a real, wired-up override (not just accepted and
+logged) for both `server` and the standalone `runner` binary — point it at
+a socket with a smaller blast radius instead of the host's main daemon:
+
+- **Rootless Podman** (recommended, no code changes needed — Podman's
+  socket speaks the same Docker Engine API `bollard` already uses):
+  ```bash
+  systemctl --user enable --now podman.socket
+  # DOCKER_SOCKET_PATH=/run/user/$(id -u)/podman/podman.sock
+  ```
+  Running as an unprivileged user, in its own user namespace, means a
+  container escape lands in that user's namespace, not root on the host.
+  This is the same technique Docker's own `rootless` mode and CI systems
+  like GitLab increasingly default to instead of the historical
+  `docker:dind` sidecar.
+- **Sysbox** (`nestybox/sysbox`) if a workload genuinely needs to run its
+  own nested Docker/Kubernetes (e.g. a CI job whose `run:` steps do
+  `docker build`, which rootless Podman alone doesn't help with) — an
+  alternative OCI runtime that gives a container real user-namespace
+  isolation *and* lets it run Docker-in-Docker safely, without
+  `--privileged` and without a host socket mount at all. Run the `server`/
+  `runner` container itself with `--runtime=sysbox-runc` and it can host
+  its own isolated `dockerd`, socket-mounted only to itself.
+- A dedicated **rootful-but-isolated** `dockerd` (e.g. a sibling container
+  or VM with nothing else on it) is the fallback if neither of the above
+  fits — smaller blast radius than sharing the *host's* daemon, even
+  though it isn't rootless.
+
+None of this is wired up as a default, since a working zero-config
+`docker compose up` needs *some* socket available — but every deployment
+that isn't purely local/throwaway should point `DOCKER_SOCKET_PATH` at one
+of the above rather than the host socket bind-mount in the shipped compose
+file.
 
 ---
 
@@ -137,7 +184,9 @@ served for interactive exploration). Exact argument types/names are in
 `repository(owner, name)`, `organizations`, `organization(name)`,
 `devWorkspaces`, `adminAllDevWorkspaces`, `myAccessTokens`,
 `adminListUsers(limit, offset)`, `myNotifications(unreadOnly)`,
-`myActivity(limit)`, `myPackages`, `search(query)`.
+`myActivity(limit)`, `myPackages`, `search(query)` (real SQLite-FTS5
+full-text search — see §4a — over repositories, issues, users, and indexed
+file content, not substring `LIKE`).
 
 ### `repository` nested fields (all resolved on the `RepositoryObject` type)
 
@@ -153,9 +202,11 @@ served for interactive exploration). Exact argument types/names are in
 `createAccessToken`, `revokeAccessToken`.
 
 **Repositories**: `createRepository`, `updateRepository`,
-`deleteRepository`, `forkRepository`, `setRepoMirror`, `setRepoSecret`,
-`addCollaborator`, `removeCollaborator`, `createWebhook`, `updateWebhook`,
-`deleteWebhook`, `createBranchProtectionRule`.
+`renameRepository(repoId, newName)` (moves the bare repo + wiki dir on
+disk and updates the DB `name`, with best-effort rollback on partial
+failure), `deleteRepository`, `forkRepository`, `setRepoMirror`,
+`setRepoSecret`, `addCollaborator`, `removeCollaborator`, `createWebhook`,
+`updateWebhook`, `deleteWebhook`, `createBranchProtectionRule`.
 
 **Issues & pull requests**: `createIssue`, `updateIssue`, `commentOnIssue`,
 `createPullRequest`, `mergePullRequest` (`mergeMethod`:
@@ -171,13 +222,41 @@ served for interactive exploration). Exact argument types/names are in
 
 **CI/CD**: `triggerWorkflowDispatch`.
 
-**Dev workspaces**: `createDevWorkspace` (optional `autoStopMinutes`),
-`startDevWorkspace`, `stopDevWorkspace`, `deleteDevWorkspace`,
-`execInDevWorkspace`.
+**Dev workspaces**: `createDevWorkspace` (optional `autoStopMinutes`,
+`onRunner` — see §7), `startDevWorkspace`, `stopDevWorkspace`,
+`deleteDevWorkspace`, `execInDevWorkspace`.
 
 **Notifications**: `markNotificationRead`.
 
-**Admin**: `adminSetUserAdmin`, `adminDeactivateUser`.
+**Admin**: `adminSetUserAdmin`, `adminDeactivateUser`,
+`adminBackfillPreReceiveHooks` (writes the branch-protection pre-receive
+hook onto every repo — including ones created before that feature
+existed; see §5).
+
+---
+
+## 4a. Search
+
+`search(query)` runs real SQLite FTS5 full-text search (via `MATCH`, with
+BM25 relevance ordering), not the substring `LIKE` matching this used to
+be limited to. Each plain alphanumeric word in `query` becomes an
+implicit-prefix match (`word*`, so results appear as you finish typing a
+term); anything else is treated as a literal quoted phrase. Terms are
+ANDed together. Covers:
+
+- **Repositories** (`name`/`description`) and **users** (`username`).
+- **Issues** (`title`/`body`), scoped to repos visible to the caller.
+- **Code**: file contents across the *default branch* of every repo
+  visible to the caller, returned as `SearchResults.code` — each hit
+  carries the matching `repository`, `path`, and an excerpt (`snippet`,
+  FTS5-generated, with `[b]...[/b]` match markers). Indexing happens
+  automatically after every push that moves the default branch (see
+  `index_repo_code_on_push` in `crates/server`): the whole tree is
+  re-walked and re-indexed (not diffed), so a force-push/history rewrite
+  is handled correctly. Binary-looking files (a NUL byte anywhere in their
+  content), files over 256KB, and repos with more than 2000 files hit an
+  indexing cap and are partially indexed rather than skipped or slow.
+  Non-default branches are not indexed.
 
 ---
 
@@ -190,11 +269,23 @@ served for interactive exploration). Exact argument types/names are in
   match against registered keys.
 - **Branch protection**: `createBranchProtectionRule` sets a required-reviews
   count and/or `blockForcePush`. Force-push blocking is enforced by a real
-  git `pre-receive` hook (written into every newly-created repo) — it
-  rejects the push at the git protocol level, not just after the fact.
-  Required-reviews is enforced in `mergePullRequest`.
+  git `pre-receive` hook, written automatically into every newly-created
+  repo — it rejects the push at the git protocol level, not just after the
+  fact. Required-reviews is enforced in `mergePullRequest`. Repos created
+  *before* branch-protection support existed don't get this hook
+  automatically; an admin can backfill it onto every repo at once (new
+  ones included, harmlessly — the write is an unconditional overwrite, not
+  conditional on "missing") via `adminBackfillPreReceiveHooks`.
 - **Merge methods**: `merge` (2-parent merge commit), `squash` (single
   commit atop target), `rebase` (replays source commits onto target).
+- **Rename**: `renameRepository(repoId, newName)` updates the DB `name`
+  and moves both the bare repo directory and (if present) its wiki
+  directory on disk to match, rejecting the rename if the owner already
+  has another repo named `newName`. Best-effort rolls back any disk
+  rename(s) already performed if a later step fails, so disk and DB don't
+  end up disagreeing about the repo's name. A dev workspace already
+  running against the old path (its bind-mount was resolved once at
+  creation time) won't pick up the new path until recreated.
 - **Wiki**: every repo gets a second bare repo (`{name}.wiki.git`)
   automatically; pages are plain Markdown files, one commit per
   `writeWikiPage` call.
@@ -215,15 +306,40 @@ Ubuntu image, anything that looks like an image tag is used directly),
 `steps[].uses: actions/checkout@*` (no-op — the repo tree is already present
 in the container). `env`, per-step `env`.
 
-**Not supported**: the GitHub Actions marketplace. Any `uses:` other than
-`actions/checkout` is logged and skipped (`... not supported in this runner,
-skipping`) rather than failing the job — so a real-world workflow with
-marketplace actions will still run its `run:` steps, just without whatever
-that action would have set up. There is no full `ubuntu-latest`-equivalent
-image with GitHub's huge pre-installed toolset — the default image is a
-plain `ubuntu:22.04`/similar, so commands like `sudo`, `npm`, language
-toolchains etc. are **not** pre-installed unless your workflow installs them
-itself or you point `runs-on` at an image that already has them.
+**Marketplace actions** (`crates/actions/src/marketplace.rs`): `uses:` steps
+now do more than a no-op for `actions/checkout`:
+
+- `uses: docker://image[:tag]` runs that image directly as a short-lived
+  sibling container: the job's `/workspace` is copied in, the image's own
+  entrypoint/cmd runs, and `/workspace` is copied back out afterward so
+  later steps see any files the action wrote. `with:` values become
+  `INPUT_*` env vars.
+- `uses: owner/repo[/path]@ref` fetches that action from GitHub (a full
+  clone, not a shallow one — see the module docs for why), resolves `ref`
+  against tags/branches/raw SHAs, and reads its `action.yml`/`action.yaml`:
+  - `runs.using: docker` — same container model as `docker://` above,
+    building from a `Dockerfile` first if `runs.image` isn't already a
+    `docker://` reference. `runs.entrypoint`/`runs.args` support
+    `${{ inputs.NAME }}` substitution.
+  - `runs.using: composite` — nested `steps` run against the *same* job
+    container (like a real composite action). One level deep only: a
+    composite action nested inside another composite action is logged and
+    skipped rather than recursing.
+  - `runs.using: node12/16/18/20` — JS actions actually run, inside a
+    helper `node:<version>-slim` container (the job's own `runs-on` image
+    has no reason to include Node) with the action's source copied in
+    alongside the job's `/workspace`.
+  - Anything else (an input-less docker action with no `image`, an
+    unresolvable ref, a runtime we don't model, a fetch failure) is logged
+    and skipped exactly like today's "not supported" path — the job
+    continues, that step is a no-op.
+
+There's still no full `ubuntu-latest`-equivalent image with GitHub's huge
+pre-installed toolset — the default image is a plain `ubuntu:22.04`/
+similar, so commands like `sudo`, `npm`, language toolchains etc. are
+**not** pre-installed unless your workflow installs them itself, a
+marketplace action sets them up, or you point `runs-on` at an image that
+already has them.
 
 **Secrets**: `setRepoSecret(repoId, name, value)` stores an
 AES-256-GCM-encrypted value (`SECRETS_ENCRYPTION_KEY` required). Job steps
@@ -256,27 +372,49 @@ Polls `POST /runner/claim` every few seconds; on a claimed job, executes it
 via the same `actions::Executor` logic as in-process execution, then
 reports back via `POST /runner/jobs/:id/complete`. Lets CI execution scale
 out to separate machines/pods without deploying the full GraphQL/git-hosting
-stack on them. Dev-workspace hosting via the runner (as opposed to CI jobs)
-is reserved in the schema (`kind = 'dev_workspace_action'`) but not yet wired
-to an active polling loop — currently dev workspaces are only managed
-in-process by `server`.
+stack on them.
+
+The runner also claims and executes `dev_workspace_action` jobs
+(`kind = 'dev_workspace_action'`) — see §7 — via its own local Docker
+daemon (`dev_env::WorkspaceManager`), reporting results (e.g. the created
+container's id) back in the same completion call's new `result` field.
 
 ---
 
 ## 7. Dev workspaces (Coder-like)
 
-`createDevWorkspace(name, template?, image?, autoStopMinutes?)` starts a
-Docker container with resource limits, optionally cloning a repo into it on
-start. Pass `template` to pick a built-in configuration (`"code-server"`,
-`"rust-dev"`, `"node-dev"` — see `dev_env::templates`), which resolves to an
-image plus a set of named ports; or pass a raw `image` for advanced/custom
-use, which falls back to the single-port code-server-only behavior. Access a
-workspace's default port through Genome's own domain via
-`GET /workspaces/:id/proxy/*path`, or an explicitly named port via
-`GET /workspaces/:id/proxy_port/:portName/*path` (both reverse-proxied to
-the container) rather than exposing raw container ports. `autoStopMinutes` +
-a background loop stop idle workspaces automatically; `execInDevWorkspace`
-runs an arbitrary command inside a running workspace.
+`createDevWorkspace(name, template?, image?, autoStopMinutes?, onRunner?)`
+starts a Docker container with resource limits, optionally cloning a repo
+into it on start. Pass `template` to pick a built-in configuration
+(`"code-server"`, `"rust-dev"`, `"node-dev"` — see `dev_env::templates`),
+which resolves to an image plus a set of named ports; or pass a raw
+`image` for advanced/custom use, which falls back to the single-port
+code-server-only behavior. Access a workspace's default port through
+Genome's own domain via `GET /workspaces/:id/proxy/*path`, or an
+explicitly named port via `GET /workspaces/:id/proxy_port/:portName/*path`
+(both reverse-proxied to the container) rather than exposing raw container
+ports. `autoStopMinutes` + a background loop stop idle workspaces
+automatically; `execInDevWorkspace` runs an arbitrary command inside a
+running workspace.
+
+**Standalone-runner-hosted workspaces**: pass `onRunner: true` to have a
+connected standalone `runner` (§6) create the container against *its own*
+Docker daemon instead of `server`'s — useful for keeping dev-workspace
+compute off the machine running the API/git-hosting stack. This enqueues a
+`dev_workspace_action` job and waits (polling the DB, up to 20s) for a
+runner to claim and execute it; the returned workspace has
+`status: "pending_runner"` and `runnerId: null` until that happens, then
+`status: "running"` with `runnerId` set. `deleteDevWorkspace` and
+`execInDevWorkspace` also route through the runner for a workspace it
+hosts. **Known gaps**: `startDevWorkspace`/`stopDevWorkspace` and the
+auto-stop background loop are not implemented for runner-hosted workspaces
+yet (they error/skip rather than acting on the wrong Docker daemon), and —
+the bigger one — live port-proxying (`GET /workspaces/:id/proxy/*path`)
+doesn't work for a runner-hosted workspace at all: its container lives on
+the runner's Docker host, which `server` has no network path to reach or
+tunnel through yet. A runner-hosted workspace is reachable via
+`execInDevWorkspace` (e.g. to inspect it or run a headless task) but not
+via the HTTP proxy today.
 
 ---
 
@@ -320,9 +458,10 @@ removal note and the git history around that change.
 ## 11. Admin operations
 
 `adminListUsers(limit, offset)`, `adminSetUserAdmin(userId, isAdmin)`,
-`adminDeactivateUser(userId)`, `adminAllDevWorkspaces` — all gated on
-`claims.is_admin`, returning a `forbidden` GraphQL error otherwise. A
-deactivated user's login (JWT or PAT) is rejected immediately.
+`adminDeactivateUser(userId)`, `adminAllDevWorkspaces`,
+`adminBackfillPreReceiveHooks` (§5) — all gated on `claims.is_admin`,
+returning a `forbidden` GraphQL error otherwise. A deactivated user's
+login (JWT or PAT) is rejected immediately.
 
 ---
 
@@ -350,14 +489,29 @@ push/PR, plus builds+pushes the Docker image to GHCR on pushes to `main`.
 
 See `JOURNAL.md` for the full, honest build log, but the headline gaps:
 
-- No full-text/code search (substring `LIKE` match only).
-- No repo rename-on-disk.
-- Existing repos created before branch-protection support don't get the
-  pre-receive hook backfilled automatically (only newly-created repos do).
-- GitHub Actions marketplace `uses:` actions are skipped, not executed
-  (only `actions/checkout` and plain `run:` steps work).
-- Standalone runner support for dev-workspace hosting (as opposed to CI
-  jobs) is schema-reserved but not implemented.
+- GitHub Actions marketplace `uses:` support (§6) covers `docker://`
+  images, `owner/repo[/path]@ref` actions with `runs.using: docker`
+  (including building from a `Dockerfile`), one level of `composite`
+  actions, and JS actions (`node12`/`16`/`18`/`20`) — but not a nested
+  composite-inside-composite action, and not the actual GitHub Actions
+  toolkit's finer behaviors (`core.setOutput`/step outputs, `GITHUB_ENV`/
+  `GITHUB_PATH` files, caching, etc.). There is still no full
+  `ubuntu-latest`-equivalent image with GitHub's huge pre-installed
+  toolset.
+- Standalone-runner-hosted dev workspaces (§7) support create/delete/exec,
+  but not start/stop or live port-proxying to the workspace — the
+  runner's container lives on a Docker daemon `server` has no network path
+  to (no reverse tunnel exists between them yet).
+- Code search (§4a) only indexes each repo's *default branch*; other
+  branches, and git history, aren't searchable.
+- Merge is a real 2-parent/squash/rebase commit, but there's still no
+  rich diff-review UI, no LFS, and no SSH-transport for anything beyond
+  git itself (e.g. no `git-lfs-transfer`).
 - Multi-node Hiqlite (true multi-machine HA) is architecturally supported
   but not yet exposed via a ready-made multi-node env-var configuration —
   single-node is the tested, default path.
+- CI/dev-workspace execution talks to a Docker Engine API socket; the
+  shipped `docker-compose.yml` bind-mounts the *host's* socket, which is a
+  large privilege-escalation surface. §2a documents safer alternatives
+  (rootless Podman, Sysbox) — `DOCKER_SOCKET_PATH` is a real, wired
+  override, not just accepted-and-ignored.

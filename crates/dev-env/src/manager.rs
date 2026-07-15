@@ -77,6 +77,18 @@ impl WorkspaceManager {
         Ok(Self { docker })
     }
 
+    /// Connects to a specific Docker (or Docker-API-compatible, e.g.
+    /// rootless Podman) socket path, honoring a configured
+    /// `DOCKER_SOCKET_PATH` instead of always resolving the platform
+    /// default. Pointing this at a rootless engine's socket instead of the
+    /// default `/var/run/docker.sock` is the supported way to run without
+    /// giving this process root-equivalent access to the host's main
+    /// Docker daemon -- see the "Container isolation" section of the docs.
+    pub fn connect_socket(path: &str) -> Result<Self> {
+        let docker = Docker::connect_with_socket(path, 120, bollard::API_DEFAULT_VERSION)?;
+        Ok(Self { docker })
+    }
+
     /// Validates a workspace name: lowercase alphanumeric and hyphens only, must start
     /// with a letter, 1-63 chars. This becomes part of the container name so it must be
     /// safe to pass to the Docker API.

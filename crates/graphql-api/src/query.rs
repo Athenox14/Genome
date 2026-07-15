@@ -4,9 +4,48 @@ use uuid::Uuid;
 
 use crate::context::{AppContext, RequestContext};
 use crate::types::{
-    AccessTokenObject, ActivityEventObject, DevWorkspaceObject, IssueObject, NotificationObject,
-    OrganizationObject, PackageObject, RepositoryObject, SearchResults, SshKeyObject, UserObject,
+    AccessTokenObject, ActivityEventObject, CodeSearchResultObject, DevWorkspaceObject, IssueObject,
+    NotificationObject, OrganizationObject, PackageObject, RepositoryObject, SearchResults,
+    SshKeyObject, UserObject,
 };
+
+/// Turns free-text user input into a safe SQLite FTS5 `MATCH` query.
+///
+/// Each whitespace-separated term becomes either an unquoted `term*` prefix
+/// match (when it's plain alphanumeric/underscore -- the common case, and
+/// what gives search-as-you-type behavior) or a double-quoted phrase with
+/// embedded quotes doubled (FTS5's own escaping rule) for anything else, so
+/// user-supplied FTS5 operators/punctuation (`AND`, `"`, `(`, `-`, ...) can
+/// never be parsed as query syntax. Terms are ANDed together (FTS5's
+/// default). Returns `None` if there are no usable terms, since `MATCH ""`
+/// is a syntax error rather than a "match nothing" query.
+fn build_fts_match_query(query: &str) -> Option<String> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|term| {
+            if !term.is_empty() && term.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                format!("{term}*")
+            } else {
+                format!("\"{}\"", term.replace('"', "\"\""))
+            }
+        })
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
+/// Row shape for the `code_search_fts` MATCH query in `search` below --
+/// there's no `entity` model for it since it's a pure FTS5 virtual table,
+/// not a regular data table with a persisted repository/entity type.
+#[derive(serde::Deserialize)]
+struct CodeSearchRow {
+    repo_id: String,
+    path: String,
+    snippet: String,
+}
 
 pub struct QueryRoot;
 
@@ -394,12 +433,23 @@ impl QueryRoot {
         Ok(packages.into_iter().map(PackageObject::from).collect())
     }
 
-    /// Basic LIKE-based search across repositories, issues, and users.
-    /// Each result list is capped at 20 entries.
+    /// Real full-text search (SQLite FTS5) across repositories, issues,
+    /// users, and indexed file content. Each result list is capped at 20
+    /// entries. Falls back to returning empty results (rather than an
+    /// error) when `query` has no usable search terms (e.g. only
+    /// punctuation/whitespace).
     async fn search(&self, ctx: &Context<'_>, query: String) -> async_graphql::Result<SearchResults> {
         let app = ctx.data::<AppContext>()?;
         let req = ctx.data::<RequestContext>()?;
-        let pattern = format!("%{}%", query);
+
+        let Some(fts_query) = build_fts_match_query(&query) else {
+            return Ok(SearchResults {
+                repositories: vec![],
+                issues: vec![],
+                users: vec![],
+                code: vec![],
+            });
+        };
 
         // Repositories: public ones, plus ones the current user owns or collaborates on.
         let mut owned_or_collab_ids: Vec<Uuid> = vec![];
@@ -427,18 +477,24 @@ impl QueryRoot {
         }
 
         let repo_sql = if owned_or_collab_ids.is_empty() {
-            "SELECT * FROM repositories WHERE is_private = 0 AND (name LIKE ?1 OR description LIKE ?1) LIMIT 20"
+            "SELECT r.* FROM repositories r \
+             JOIN repositories_fts ON repositories_fts.id = r.id \
+             WHERE repositories_fts MATCH ?1 AND r.is_private = 0 \
+             ORDER BY repositories_fts.rank LIMIT 20"
                 .to_string()
         } else {
             let placeholders: Vec<String> = (2..=owned_or_collab_ids.len() + 1)
                 .map(|i| format!("?{i}"))
                 .collect();
             format!(
-                "SELECT * FROM repositories WHERE (is_private = 0 OR id IN ({})) AND (name LIKE ?1 OR description LIKE ?1) LIMIT 20",
+                "SELECT r.* FROM repositories r \
+                 JOIN repositories_fts ON repositories_fts.id = r.id \
+                 WHERE repositories_fts MATCH ?1 AND (r.is_private = 0 OR r.id IN ({})) \
+                 ORDER BY repositories_fts.rank LIMIT 20",
                 placeholders.join(", ")
             )
         };
-        let mut repo_params = vec![hiqlite::Param::Text(pattern.clone())];
+        let mut repo_params = vec![hiqlite::Param::Text(fts_query.clone())];
         for id in &owned_or_collab_ids {
             repo_params.push(hiqlite::Param::Text(id.to_string()));
         }
@@ -451,8 +507,8 @@ impl QueryRoot {
             repositories.push(RepositoryObject::from_model(&app.db, r).await);
         }
 
-        // Issues: only from repos visible to the current search context (public,
-        // or owned/collaborated-on by the current user).
+        // Issues + code: only from repos visible to the current search context
+        // (public, or owned/collaborated-on by the current user).
         let visible_repo_sql = if owned_or_collab_ids.is_empty() {
             "SELECT * FROM repositories WHERE is_private = 0".to_string()
         } else {
@@ -466,34 +522,74 @@ impl QueryRoot {
             .iter()
             .map(|id| hiqlite::Param::Text(id.to_string()))
             .collect();
-        let visible_repo_ids: Vec<Uuid> = app
+        let visible_repos = app
             .db
             .query_as::<entity::repository::Model, _>(visible_repo_sql, visible_repo_params)
-            .await?
-            .into_iter()
-            .map(|r| r.id)
-            .collect();
+            .await?;
+        let visible_repo_ids: Vec<Uuid> = visible_repos.iter().map(|r| r.id).collect();
 
         let issues = if visible_repo_ids.is_empty() {
             vec![]
         } else {
             let placeholders: Vec<String> = (2..=visible_repo_ids.len() + 1).map(|i| format!("?{i}")).collect();
             let sql = format!(
-                "SELECT * FROM issues WHERE repo_id IN ({}) AND (title LIKE ?1 OR body LIKE ?1) LIMIT 20",
+                "SELECT i.* FROM issues i \
+                 JOIN issues_fts ON issues_fts.id = i.id \
+                 WHERE issues_fts MATCH ?1 AND i.repo_id IN ({}) \
+                 ORDER BY issues_fts.rank LIMIT 20",
                 placeholders.join(", ")
             );
-            let mut p = vec![hiqlite::Param::Text(pattern.clone())];
+            let mut p = vec![hiqlite::Param::Text(fts_query.clone())];
             for id in &visible_repo_ids {
                 p.push(hiqlite::Param::Text(id.to_string()));
             }
             app.db.query_as::<entity::issue::Model, _>(sql, p).await?
         };
 
+        let code = if visible_repo_ids.is_empty() {
+            vec![]
+        } else {
+            let placeholders: Vec<String> = (2..=visible_repo_ids.len() + 1).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT repo_id, path, \
+                     snippet(code_search_fts, 2, '[b]', '[/b]', '...', 12) AS snippet \
+                 FROM code_search_fts \
+                 WHERE code_search_fts MATCH ?1 AND repo_id IN ({}) \
+                 ORDER BY rank LIMIT 20",
+                placeholders.join(", ")
+            );
+            let mut p = vec![hiqlite::Param::Text(fts_query.clone())];
+            for id in &visible_repo_ids {
+                p.push(hiqlite::Param::Text(id.to_string()));
+            }
+            app.db
+                .query_as::<CodeSearchRow, _>(sql, p)
+                .await?
+        };
+        let repos_by_id: std::collections::HashMap<Uuid, entity::repository::Model> =
+            visible_repos.into_iter().map(|r| (r.id, r)).collect();
+        let mut code_results = Vec::with_capacity(code.len());
+        for row in code {
+            let Ok(repo_id) = row.repo_id.parse::<Uuid>() else {
+                continue;
+            };
+            let Some(repo) = repos_by_id.get(&repo_id).cloned() else {
+                continue;
+            };
+            code_results.push(CodeSearchResultObject {
+                repository: RepositoryObject::from_model(&app.db, repo).await,
+                path: row.path,
+                snippet: row.snippet,
+            });
+        }
+
         let users = app
             .db
             .query_as::<entity::user::Model, _>(
-                "SELECT * FROM users WHERE username LIKE ?1 LIMIT 20",
-                params!(pattern),
+                "SELECT u.* FROM users u \
+                 JOIN users_fts ON users_fts.id = u.id \
+                 WHERE users_fts MATCH ?1 ORDER BY users_fts.rank LIMIT 20",
+                params!(fts_query),
             )
             .await?;
 
@@ -501,6 +597,7 @@ impl QueryRoot {
             repositories,
             issues: issues.into_iter().map(IssueObject::from).collect(),
             users: users.into_iter().map(UserObject::from).collect(),
+            code: code_results,
         })
     }
 }

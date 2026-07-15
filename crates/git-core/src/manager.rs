@@ -66,12 +66,9 @@ impl RepoManager {
     /// here when compiled for unix; on Windows there is no executable bit to
     /// set, so that step is skipped (no-op).
     ///
-    /// SCOPE NOTE: this hook is only written when a repo is *newly created*
-    /// via `init_repo`. Repositories that already existed before this change
-    /// shipped will not have the hook and must have it backfilled manually
-    /// (e.g. a one-off maintenance script that re-runs this same write for
-    /// every existing bare repo under `root`) -- that backfill is out of
-    /// scope here.
+    /// This hook is written automatically for repos created via
+    /// `init_repo`; for repos that predate branch-protection support, call
+    /// `ensure_pre_receive_hook` (below) to backfill it.
     fn write_pre_receive_hook(repo_path: &Path, owner: &str, name: &str) -> Result<()> {
         let current_exe = std::env::current_exe().map_err(GitCoreError::Io)?;
         // The hook runs with a cwd controlled by git (typically the repo dir
@@ -118,6 +115,17 @@ impl RepoManager {
         }
 
         Ok(())
+    }
+
+    /// Write (or re-write) the branch-protection pre-receive hook for a repo
+    /// that already exists on disk. `init_repo` already does this for newly
+    /// created repos; this is the public entry point for backfilling it onto
+    /// repos that predate branch-protection support. Safe to call
+    /// unconditionally and repeatedly -- the hook file is fully overwritten
+    /// each time, there is no "already has it" state to check first.
+    pub fn ensure_pre_receive_hook(&self, owner: &str, name: &str) -> Result<()> {
+        let path = self.repo_path(owner, name)?;
+        Self::write_pre_receive_hook(&path, owner, name)
     }
 
     /// Compute the filesystem path for a repository's wiki (a second bare
@@ -276,6 +284,41 @@ impl RepoManager {
         if path.exists() {
             std::fs::remove_dir_all(&path)?;
         }
+        Ok(())
+    }
+
+    /// Move a repository's bare directory on disk from `{owner}/{old_name}.git`
+    /// to `{owner}/{new_name}.git`. The caller is expected to have already
+    /// checked (via the DB, e.g. `idx_repositories_owner_name`) that
+    /// `new_name` doesn't collide with an existing repo for this owner --
+    /// this only guards against the on-disk directory itself already being
+    /// occupied, which would indicate the DB and disk have drifted apart.
+    pub fn rename_repo(&self, owner: &str, old_name: &str, new_name: &str) -> Result<()> {
+        let old_path = self.repo_path(owner, old_name)?;
+        let new_path = self.repo_path(owner, new_name)?;
+        if !old_path.exists() {
+            return Err(GitCoreError::RepoNotFound(old_path));
+        }
+        if new_path.exists() {
+            return Err(GitCoreError::RepoAlreadyExists(new_path));
+        }
+        std::fs::rename(&old_path, &new_path)?;
+        Ok(())
+    }
+
+    /// Move a repository's wiki bare directory on disk, mirroring
+    /// `rename_repo`. Unlike `rename_repo`, a missing source wiki is not an
+    /// error -- not every repository has one.
+    pub fn rename_wiki(&self, owner: &str, old_name: &str, new_name: &str) -> Result<()> {
+        let old_path = self.wiki_repo_path(owner, old_name);
+        if !old_path.exists() {
+            return Ok(());
+        }
+        let new_path = self.wiki_repo_path(owner, new_name);
+        if new_path.exists() {
+            return Err(GitCoreError::RepoAlreadyExists(new_path));
+        }
+        std::fs::rename(&old_path, &new_path)?;
         Ok(())
     }
 
@@ -546,6 +589,72 @@ impl RepoManager {
 
         let data = builder.into_inner()?;
         Ok(data)
+    }
+
+    /// Recursively collect `(path, content)` pairs for every blob in the
+    /// tree at `git_ref`, for feeding into the code-search index. Skips
+    /// blobs over `max_file_bytes` and anything that looks binary (a NUL
+    /// byte anywhere in the content), and stops once `max_files` blobs
+    /// have been collected -- both are indexing-cost guards, not
+    /// correctness requirements, so a huge/binary-heavy repo degrades to
+    /// a partial index rather than an expensive or garbage one.
+    pub fn list_text_blobs_at_ref(
+        &self,
+        owner: &str,
+        name: &str,
+        git_ref: &str,
+        max_files: usize,
+        max_file_bytes: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let (repo, _) = self.open(owner, name)?;
+        let commit = self.resolve_commit(&repo, git_ref)?;
+        let tree = commit.tree()?;
+        let mut out = Vec::new();
+        Self::collect_text_blobs(&repo, &tree, "", max_files, max_file_bytes, &mut out)?;
+        Ok(out)
+    }
+
+    fn collect_text_blobs(
+        repo: &Repository,
+        tree: &git2::Tree,
+        prefix: &str,
+        max_files: usize,
+        max_file_bytes: usize,
+        out: &mut Vec<(String, Vec<u8>)>,
+    ) -> Result<()> {
+        for entry in tree.iter() {
+            if out.len() >= max_files {
+                return Ok(());
+            }
+            let entry_name = entry.name().unwrap_or_default().to_string();
+            let full_path = format!("{prefix}{entry_name}");
+            match entry.kind() {
+                Some(ObjectType::Tree) => {
+                    let object = entry.to_object(repo)?;
+                    if let Some(subtree) = object.as_tree() {
+                        Self::collect_text_blobs(
+                            repo,
+                            subtree,
+                            &format!("{full_path}/"),
+                            max_files,
+                            max_file_bytes,
+                            out,
+                        )?;
+                    }
+                }
+                Some(ObjectType::Blob) => {
+                    let object = entry.to_object(repo)?;
+                    if let Some(blob) = object.as_blob() {
+                        let content = blob.content();
+                        if content.len() <= max_file_bytes && !content.contains(&0u8) {
+                            out.push((full_path, content.to_vec()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Merge `source_branch` into `target_branch`. If the target is already
@@ -1060,5 +1169,60 @@ mod tests {
             .wiki_list_pages("acme", "widgets")
             .expect("list pages again");
         assert_eq!(pages2, vec!["Home".to_string()]);
+    }
+
+    #[test]
+    fn rename_repo_moves_bare_dir_and_wiki() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = RepoManager::new(dir.path());
+        manager.init_repo("acme", "widgets").expect("init repo");
+        manager.init_wiki("acme", "widgets").expect("init wiki");
+
+        let old_path = manager.repo_path("acme", "widgets").expect("old repo path");
+        let old_wiki_path = manager.wiki_repo_path("acme", "widgets");
+        assert!(old_path.exists());
+        assert!(old_wiki_path.exists());
+
+        manager
+            .rename_repo("acme", "widgets", "gadgets")
+            .expect("rename repo");
+        manager
+            .rename_wiki("acme", "widgets", "gadgets")
+            .expect("rename wiki");
+
+        assert!(!old_path.exists());
+        assert!(!old_wiki_path.exists());
+        let new_path = manager.repo_path("acme", "gadgets").expect("new repo path");
+        let new_wiki_path = manager.wiki_repo_path("acme", "gadgets");
+        assert!(new_path.exists());
+        assert!(new_wiki_path.exists());
+
+        // Renaming onto an existing name is rejected, and rename_wiki is a
+        // no-op (not an error) when the source repo has no wiki.
+        manager.init_repo("acme", "taken").expect("init repo");
+        assert!(manager.rename_repo("acme", "gadgets", "taken").is_err());
+        manager.init_repo("acme", "no-wiki").expect("init repo");
+        assert!(manager.rename_wiki("acme", "no-wiki", "no-wiki-2").is_ok());
+    }
+
+    #[test]
+    fn ensure_pre_receive_hook_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = RepoManager::new(dir.path());
+        manager.init_repo("acme", "widgets").expect("init repo");
+
+        let hook_path = manager
+            .repo_path("acme", "widgets")
+            .expect("repo path")
+            .join("hooks")
+            .join("pre-receive");
+        assert!(hook_path.exists());
+
+        // Backfilling onto a repo that already has the hook (from
+        // `init_repo`) is safe to call again.
+        manager
+            .ensure_pre_receive_hook("acme", "widgets")
+            .expect("backfill hook");
+        assert!(hook_path.exists());
     }
 }
