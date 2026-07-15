@@ -76,6 +76,91 @@ async fn record_activity(app: &AppContext, repo_id: Option<Uuid>, actor_id: Uuid
     }
 }
 
+/// Enqueues a `dev_workspace_action` job (`kind::DEV_WORKSPACE_ACTION`) for
+/// a standalone runner to claim via `POST /runner/claim`, merging `action`
+/// into `payload` under the `"action"` key. Returns the new job's id.
+async fn enqueue_dev_workspace_job(
+    app: &AppContext,
+    action: &str,
+    payload: &serde_json::Value,
+) -> async_graphql::Result<Uuid> {
+    let job_id = Uuid::new_v4();
+    let mut full_payload = payload.clone();
+    if let Some(obj) = full_payload.as_object_mut() {
+        obj.insert("action".to_string(), serde_json::Value::String(action.to_string()));
+    }
+    app.db
+        .execute(
+            "INSERT INTO runner_jobs (id, kind, repo_id, workflow_run_id, payload, status, claimed_by, claimed_at, created_at, finished_at, result) \
+             VALUES (?1, ?2, NULL, NULL, ?3, ?4, NULL, NULL, ?5, NULL, NULL)",
+            params!(
+                job_id.to_string(),
+                entity::runner_job::kind::DEV_WORKSPACE_ACTION.to_string(),
+                full_payload.to_string(),
+                entity::runner_job::status::QUEUED.to_string(),
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .await?;
+    Ok(job_id)
+}
+
+/// Polls `runner_jobs` for a job enqueued by `enqueue_dev_workspace_job` to
+/// reach a terminal status, up to `timeout`. This is plain DB polling
+/// rather than a push notification -- there's no pub/sub infrastructure in
+/// this codebase -- so it trades a little latency (bounded by the poll
+/// interval below, well under the runner's own ~5s claim-loop interval)
+/// for simplicity.
+async fn wait_for_runner_job(
+    app: &AppContext,
+    job_id: Uuid,
+    timeout: std::time::Duration,
+) -> async_graphql::Result<entity::runner_job::Model> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let job = app
+            .db
+            .query_as::<entity::runner_job::Model, _>(
+                "SELECT * FROM runner_jobs WHERE id = ?1",
+                params!(job_id.to_string()),
+            )
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| async_graphql::Error::new("runner job disappeared"))?;
+        if job.status == entity::runner_job::status::SUCCESS || job.status == entity::runner_job::status::FAILURE {
+            return Ok(job);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(async_graphql::Error::new(
+                "timed out waiting for a standalone runner to claim this dev workspace action -- is one connected?",
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+}
+
+/// Extracts `(status, container_id, runner_id)` from a completed `create`
+/// dev-workspace job. On failure (or an unparseable/missing result), status
+/// is `entity::dev_workspace::status::ERROR` with both ids left `None`.
+fn apply_create_result(job: &entity::runner_job::Model) -> (String, Option<String>, Option<String>) {
+    if job.status != entity::runner_job::status::SUCCESS {
+        return (entity::dev_workspace::status::ERROR.to_string(), None, None);
+    }
+    let Some(result) = &job.result else {
+        return (entity::dev_workspace::status::ERROR.to_string(), None, None);
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(result) else {
+        return (entity::dev_workspace::status::ERROR.to_string(), None, None);
+    };
+    let container_id = parsed.get("container_id").and_then(|v| v.as_str()).map(str::to_string);
+    let runner_id = parsed.get("runner_id").and_then(|v| v.as_str()).map(str::to_string);
+    if container_id.is_none() {
+        return (entity::dev_workspace::status::ERROR.to_string(), None, None);
+    }
+    (entity::dev_workspace::status::RUNNING.to_string(), container_id, runner_id)
+}
+
 fn username_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^[a-zA-Z0-9_-]{3,32}$").unwrap())
@@ -443,6 +528,45 @@ impl MutationRoot {
         Ok(UserObject::from(user))
     }
 
+    /// Writes (or re-writes) the branch-protection pre-receive hook onto
+    /// every repository in the instance. `init_repo` already writes this
+    /// hook for newly-created repos; this is the one-off maintenance
+    /// operation for backfilling it onto repos that predate
+    /// branch-protection support. Safe to run more than once -- it's a
+    /// plain overwrite for every repo, not just ones missing the hook.
+    /// Returns the number of repos it wrote the hook for; a repo whose
+    /// on-disk directory can't be found (or written to) is logged and
+    /// skipped rather than failing the whole operation.
+    async fn admin_backfill_pre_receive_hooks(&self, ctx: &Context<'_>) -> async_graphql::Result<i32> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+        if !claims.is_admin {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        let repos = app
+            .db
+            .query_as::<entity::repository::Model, _>("SELECT * FROM repositories", params!())
+            .await?;
+
+        let mut count = 0i32;
+        for repo in repos {
+            let owner_login = resolve_owner_login(&app.db, &repo.owner_type, repo.owner_id)
+                .await
+                .unwrap_or_default();
+            match app.repo_manager.ensure_pre_receive_hook(&owner_login, &repo.name) {
+                Ok(()) => count += 1,
+                Err(e) => tracing::warn!(
+                    "failed to backfill pre-receive hook for {owner_login}/{}: {e}",
+                    repo.name
+                ),
+            }
+        }
+
+        Ok(count)
+    }
+
     async fn create_repository(
         &self,
         ctx: &Context<'_>,
@@ -539,10 +663,83 @@ impl MutationRoot {
         Ok(true)
     }
 
+    /// Renames a repository: updates the DB `name` column and moves both
+    /// the bare repo directory and (if present) its wiki directory on disk
+    /// to match. Requires Admin permission on the repository. Errors if the
+    /// owner already has another repository named `new_name`. On partial
+    /// failure (e.g. the wiki move or the DB update fails after the repo
+    /// directory was already moved), best-effort rolls back the disk
+    /// rename(s) already performed so disk and DB don't end up disagreeing
+    /// about the repo's name.
+    async fn rename_repository(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        new_name: String,
+    ) -> async_graphql::Result<RepositoryObject> {
+        let app = ctx.data::<AppContext>()?;
+        let req = ctx.data::<RequestContext>()?;
+        let claims = require_user(req)?;
+
+        let mut repo = find_repo(app, repo_id).await?;
+        let perm = repo_permission(app, &repo, claims.sub).await?;
+        if perm != Some(Permission::Admin) {
+            return Err(async_graphql::Error::new("forbidden"));
+        }
+
+        if new_name == repo.name {
+            return Ok(RepositoryObject::from_model(&app.db, repo).await);
+        }
+
+        let existing = app
+            .db
+            .query_as::<entity::repository::Model, _>(
+                "SELECT * FROM repositories WHERE owner_type = ?1 AND owner_id = ?2 AND name = ?3",
+                params!(repo.owner_type.clone(), repo.owner_id.to_string(), new_name.clone()),
+            )
+            .await?
+            .into_iter()
+            .next();
+        if existing.is_some() {
+            return Err(async_graphql::Error::new(format!(
+                "owner already has a repository named '{new_name}'"
+            )));
+        }
+
+        let owner_login = resolve_owner_login(&app.db, &repo.owner_type, repo.owner_id)
+            .await
+            .unwrap_or_default();
+        let old_name = repo.name.clone();
+
+        app.repo_manager
+            .rename_repo(&owner_login, &old_name, &new_name)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        if let Err(e) = app.repo_manager.rename_wiki(&owner_login, &old_name, &new_name) {
+            let _ = app.repo_manager.rename_repo(&owner_login, &new_name, &old_name);
+            return Err(async_graphql::Error::new(e.to_string()));
+        }
+
+        if let Err(e) = app
+            .db
+            .execute(
+                "UPDATE repositories SET name = ?1 WHERE id = ?2",
+                params!(new_name.clone(), repo_id.to_string()),
+            )
+            .await
+        {
+            let _ = app.repo_manager.rename_wiki(&owner_login, &new_name, &old_name);
+            let _ = app.repo_manager.rename_repo(&owner_login, &new_name, &old_name);
+            return Err(e.into());
+        }
+
+        repo.name = new_name;
+        Ok(RepositoryObject::from_model(&app.db, repo).await)
+    }
+
     /// Updates a repository's mutable metadata (description, visibility,
-    /// default branch). Requires Admin permission on the repository. Does
-    /// not rename the repository on disk; renaming is not currently
-    /// supported.
+    /// default branch). Requires Admin permission on the repository. Use
+    /// `renameRepository` to change its name.
     async fn update_repository(
         &self,
         ctx: &Context<'_>,
@@ -1878,6 +2075,22 @@ impl MutationRoot {
     /// raw `image` for advanced/custom use. `template` takes precedence if
     /// both are given; a raw `image` with no `template` falls back to the
     /// single-port code-server-only behavior that predates templates.
+    ///
+    /// If `on_runner` is true, instead of creating the container directly
+    /// against `server`'s own Docker daemon, this enqueues a
+    /// `dev_workspace_action` job (`kind::DEV_WORKSPACE_ACTION`) for a
+    /// connected standalone `runner` process to claim and create the
+    /// container against its *own* Docker daemon (see
+    /// `runner/src/dev_workspace_poll.rs`). The returned workspace has
+    /// `status: "pending_runner"` and a `null` `containerId`/`runnerId`
+    /// until a runner claims the job (poll `devWorkspace(id)` for the
+    /// updated status). Errors if no runner claims it within 20s.
+    ///
+    /// Known gap: live port-proxying (`GET /workspaces/:id/proxy/*path`)
+    /// only works for server-hosted workspaces today -- a runner-hosted
+    /// workspace's container is on a different, not-necessarily-reachable
+    /// Docker host, and there is no reverse-tunnel between the runner and
+    /// `server` yet to route proxied HTTP requests to it.
     async fn create_dev_workspace(
         &self,
         ctx: &Context<'_>,
@@ -1886,6 +2099,7 @@ impl MutationRoot {
         image: Option<String>,
         repo_id: Option<Uuid>,
         auto_stop_minutes: Option<i32>,
+        on_runner: Option<bool>,
     ) -> async_graphql::Result<DevWorkspaceObject> {
         let app = ctx.data::<AppContext>()?;
         let req = ctx.data::<RequestContext>()?;
@@ -1916,6 +2130,63 @@ impl MutationRoot {
             None
         };
 
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+
+        if on_runner.unwrap_or(false) {
+            let payload = serde_json::json!({
+                "workspace_id": id,
+                "name": name,
+                "image": image,
+                "ports": ports.iter().map(|(n, p)| (n.to_string(), *p)).collect::<Vec<_>>(),
+                "repo_clone_url": repo_clone_url,
+                "owner": claims.username,
+            });
+            let job_id = enqueue_dev_workspace_job(app, "create", &payload).await?;
+
+            let status = entity::dev_workspace::status::PENDING_RUNNER.to_string();
+            app.db
+                .execute(
+                    "INSERT INTO dev_workspaces (id, owner_id, repo_id, name, image, status, container_id, created_at, auto_stop_minutes, last_activity_at, runner_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, NULL, NULL)",
+                    params!(
+                        id.to_string(),
+                        claims.sub.to_string(),
+                        repo_id.map(|r| r.to_string()),
+                        name.clone(),
+                        image.clone(),
+                        status.clone(),
+                        created_at.to_rfc3339(),
+                        auto_stop_minutes
+                    ),
+                )
+                .await?;
+
+            let job = wait_for_runner_job(app, job_id, std::time::Duration::from_secs(20)).await?;
+            let (final_status, container_id, runner_id) = apply_create_result(&job);
+            app.db
+                .execute(
+                    "UPDATE dev_workspaces SET status = ?1, container_id = ?2, runner_id = ?3 WHERE id = ?4",
+                    params!(final_status.clone(), container_id.clone(), runner_id.clone(), id.to_string()),
+                )
+                .await?;
+
+            let workspace = entity::dev_workspace::Model {
+                id,
+                owner_id: claims.sub,
+                repo_id,
+                name,
+                image,
+                status: final_status,
+                container_id,
+                created_at,
+                auto_stop_minutes,
+                last_activity_at: None,
+                runner_id,
+            };
+            return Ok(DevWorkspaceObject::from(workspace));
+        }
+
         let handle = app
             .workspace_manager
             .create_workspace(
@@ -1930,15 +2201,13 @@ impl MutationRoot {
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-        let id = Uuid::new_v4();
-        let created_at = Utc::now();
         let status = entity::dev_workspace::status::RUNNING.to_string();
         let container_id = Some(handle.container_id);
         let last_activity_at = Some(Utc::now());
         app.db
             .execute(
-                "INSERT INTO dev_workspaces (id, owner_id, repo_id, name, image, status, container_id, created_at, auto_stop_minutes, last_activity_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO dev_workspaces (id, owner_id, repo_id, name, image, status, container_id, created_at, auto_stop_minutes, last_activity_at, runner_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
                 params!(
                     id.to_string(),
                     claims.sub.to_string(),
@@ -1965,6 +2234,7 @@ impl MutationRoot {
             created_at,
             auto_stop_minutes,
             last_activity_at,
+            runner_id: None,
         };
         Ok(DevWorkspaceObject::from(workspace))
     }
@@ -1986,6 +2256,11 @@ impl MutationRoot {
             .ok_or_else(|| async_graphql::Error::new("workspace not found"))?;
         if workspace.owner_id != claims.sub {
             return Err(async_graphql::Error::new("forbidden"));
+        }
+        if workspace.runner_id.is_some() {
+            return Err(async_graphql::Error::new(
+                "starting/stopping a runner-hosted dev workspace is not supported yet -- delete and recreate it instead",
+            ));
         }
         let container_id = workspace
             .container_id
@@ -2025,6 +2300,11 @@ impl MutationRoot {
             .ok_or_else(|| async_graphql::Error::new("workspace not found"))?;
         if workspace.owner_id != claims.sub {
             return Err(async_graphql::Error::new("forbidden"));
+        }
+        if workspace.runner_id.is_some() {
+            return Err(async_graphql::Error::new(
+                "starting/stopping a runner-hosted dev workspace is not supported yet -- delete and recreate it instead",
+            ));
         }
         let container_id = workspace
             .container_id
@@ -2066,7 +2346,21 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("forbidden"));
         }
 
-        if let Some(container_id) = &workspace.container_id {
+        if workspace.runner_id.is_some() {
+            if let Some(container_id) = &workspace.container_id {
+                let payload = serde_json::json!({
+                    "workspace_id": workspace.id,
+                    "container_id": container_id,
+                });
+                let job_id = enqueue_dev_workspace_job(app, "delete", &payload).await?;
+                // Best-effort: the DB row is removed below regardless of
+                // whether the runner confirms deletion in time, so a slow
+                // or disconnected runner doesn't strand the user with an
+                // undeletable workspace record -- it may leave an orphaned
+                // container on the runner's host if the job never lands.
+                let _ = wait_for_runner_job(app, job_id, std::time::Duration::from_secs(20)).await;
+            }
+        } else if let Some(container_id) = &workspace.container_id {
             app.workspace_manager
                 .delete_workspace(container_id)
                 .await
@@ -2889,6 +3183,26 @@ impl MutationRoot {
             .container_id
             .clone()
             .ok_or_else(|| async_graphql::Error::new("workspace has no container"))?;
+
+        if workspace.runner_id.is_some() {
+            let payload = serde_json::json!({
+                "workspace_id": workspace.id,
+                "container_id": container_id,
+                "cmd": command,
+            });
+            let job_id = enqueue_dev_workspace_job(app, "exec", &payload).await?;
+            let job = wait_for_runner_job(app, job_id, std::time::Duration::from_secs(20)).await?;
+            if job.status != entity::runner_job::status::SUCCESS {
+                return Err(async_graphql::Error::new("exec failed on the runner-hosted workspace"));
+            }
+            let output = job
+                .result
+                .as_deref()
+                .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+                .and_then(|v| v.get("output").and_then(|o| o.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            return Ok(output);
+        }
 
         let output = app
             .workspace_manager

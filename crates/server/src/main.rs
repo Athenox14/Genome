@@ -154,8 +154,11 @@ async fn main() -> anyhow::Result<()> {
         .parent()
         .map(|p| p.join("artifacts"))
         .unwrap_or_else(|| std::path::PathBuf::from("./artifacts"));
-    let actions_executor = Arc::new(actions::Executor::new(artifacts_root)?);
-    let workspace_manager = Arc::new(dev_env::WorkspaceManager::connect_local()?);
+    let actions_executor = Arc::new(actions::Executor::new_with_socket(
+        artifacts_root,
+        &config.docker_socket_path,
+    )?);
+    let workspace_manager = Arc::new(dev_env::WorkspaceManager::connect_socket(&config.docker_socket_path)?);
     let webhook_dispatcher = Arc::new(webhooks::WebhookDispatcher::new(db.clone()));
 
     let app_ctx = AppContext {
@@ -398,6 +401,17 @@ async fn receive_pack_handler(
                 tracing::warn!("post-push workflow processing failed: {e}");
             }
         });
+
+        let app_ctx = state.app_ctx.clone();
+        let owner_clone = owner.clone();
+        let repo_clone = repo_name.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                index_repo_code_on_push(app_ctx, owner_clone, repo_clone, changes).await
+            {
+                tracing::warn!("post-push code-search indexing failed: {e}");
+            }
+        });
     }
 
     let content_type =
@@ -408,6 +422,82 @@ async fn receive_pack_handler(
         result,
     )
         .into_response())
+}
+
+/// Fire-and-forget task run after a successful `git-receive-pack`:
+/// re-indexes the repository's default branch tip into `code_search_fts`
+/// (SQLite FTS5) for the `search` GraphQL query's code-search results.
+/// A no-op if the push didn't move the default branch. Re-indexing always
+/// replaces the repo's whole previous index rather than diffing, since a
+/// force-push or history rewrite can change any file, not just the ones
+/// in the immediate diff.
+async fn index_repo_code_on_push(
+    app_ctx: AppContext,
+    owner: String,
+    repo: String,
+    changes: Vec<(String, String, String)>,
+) -> anyhow::Result<()> {
+    const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+    // Indexing-cost guards (see `RepoManager::list_text_blobs_at_ref`), not
+    // correctness requirements: a huge/binary-heavy repo gets a partial
+    // index rather than an expensive or garbage one.
+    const MAX_FILES: usize = 2000;
+    const MAX_FILE_BYTES: usize = 256 * 1024;
+
+    let repo_row = app_ctx
+        .db
+        .query_as::<entity::repository::Model, _>(
+            "SELECT * FROM repositories WHERE name = ?1",
+            params!(repo.clone()),
+        )
+        .await?
+        .into_iter()
+        .next();
+    let Some(repo_row) = repo_row else {
+        return Ok(());
+    };
+
+    let default_ref = format!("refs/heads/{}", repo_row.default_branch);
+    let Some((_, _, new_sha)) = changes.iter().find(|(r, _, _)| *r == default_ref) else {
+        return Ok(());
+    };
+    if new_sha == ZERO_SHA {
+        // Default branch was deleted outright: drop its index entirely.
+        app_ctx
+            .db
+            .execute(
+                "DELETE FROM code_search_fts WHERE repo_id = ?1",
+                params!(repo_row.id.to_string()),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    let blobs =
+        app_ctx
+            .repo_manager
+            .list_text_blobs_at_ref(&owner, &repo, new_sha, MAX_FILES, MAX_FILE_BYTES)?;
+
+    app_ctx
+        .db
+        .execute(
+            "DELETE FROM code_search_fts WHERE repo_id = ?1",
+            params!(repo_row.id.to_string()),
+        )
+        .await?;
+
+    for (path, content) in blobs {
+        let text = String::from_utf8_lossy(&content).into_owned();
+        app_ctx
+            .db
+            .execute(
+                "INSERT INTO code_search_fts (repo_id, path, content) VALUES (?1, ?2, ?3)",
+                params!(repo_row.id.to_string(), path, text),
+            )
+            .await?;
+    }
+
+    Ok(())
 }
 
 /// Fire-and-forget task run after a successful `git-receive-pack`: discovers
@@ -907,6 +997,14 @@ struct RunnerCompleteRequest {
     status: String,
     #[allow(dead_code)]
     logs: String,
+    /// Structured result JSON, currently only produced for
+    /// `dev_workspace_action` jobs (e.g. `{"container_id": ..., "runner_id": ...}`
+    /// for `create`, `{"output": ...}` for `exec`) -- `None` for CI jobs.
+    /// Stored verbatim on `runner_jobs.result` for a polling GraphQL
+    /// mutation (see `wait_for_runner_job` in `graphql-api::mutation`) to
+    /// read back.
+    #[serde(default)]
+    result: Option<String>,
 }
 
 /// `POST /runner/jobs/:id/complete` -- reports the result of a job claimed
@@ -962,8 +1060,8 @@ async fn runner_complete_handler(
         .app_ctx
         .db
         .execute(
-            "UPDATE runner_jobs SET status = ?1, finished_at = ?2 WHERE id = ?3",
-            params!(status.to_string(), now.clone(), job_id.to_string()),
+            "UPDATE runner_jobs SET status = ?1, finished_at = ?2, result = ?3 WHERE id = ?4",
+            params!(status.to_string(), now.clone(), body.result.clone(), job_id.to_string()),
         )
         .await?;
 
@@ -1150,6 +1248,13 @@ async fn auto_stop_dev_workspaces(app_ctx: AppContext) {
                 continue;
             }
 
+            if workspace.runner_id.is_some() {
+                // Auto-stop isn't wired up for runner-hosted workspaces yet
+                // (see `stop_dev_workspace`'s same restriction) -- their
+                // container lives on a different Docker daemon than the
+                // one `app_ctx.workspace_manager` talks to.
+                continue;
+            }
             let Some(container_id) = workspace.container_id.clone() else {
                 continue;
             };
@@ -1346,6 +1451,16 @@ async fn proxy_workspace_request(
         .into_iter()
         .next()
         .ok_or_else(|| ServerError::NotFound(format!("workspace {id} not found")))?;
+
+    if workspace.runner_id.is_some() {
+        // Known gap (see `create_dev_workspace`'s `on_runner` doc comment):
+        // a runner-hosted workspace's container lives on the runner's own
+        // Docker daemon, which `server` has no network path to reach or
+        // proxy through yet (no reverse tunnel exists between them).
+        return Err(ServerError::BadRequest(
+            "live port-proxying to runner-hosted dev workspaces is not supported yet".to_string(),
+        ));
+    }
 
     let container_id = workspace
         .container_id

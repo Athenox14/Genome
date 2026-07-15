@@ -26,13 +26,18 @@ pub struct Model {
     pub claimed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// Raw JSON result reported back via `POST /runner/jobs/:id/complete`,
+    /// e.g. `{"container_id": "...", "runner_id": "..."}` for a `create`
+    /// dev-workspace action, or `{"output": "..."}` for `exec`. `None` for
+    /// CI jobs (which don't report a structured result, only logs) and for
+    /// any job not yet completed.
+    pub result: Option<String>,
 }
 
 pub mod kind {
     pub const CI_JOB: &str = "ci_job";
-    /// TODO(future work): dev-workspace hosting via the standalone runner is
-    /// not implemented yet; this kind is reserved so the schema doesn't need
-    /// another migration when that lands.
+    /// Dev-workspace hosting via a standalone runner: see
+    /// `runner/src/dev_workspace_poll.rs` for the payload/result shape.
     pub const DEV_WORKSPACE_ACTION: &str = "dev_workspace_action";
 }
 

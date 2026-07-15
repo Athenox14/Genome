@@ -562,6 +562,10 @@ pub struct DevWorkspaceObject {
     pub created_at: DateTime<Utc>,
     pub auto_stop_minutes: Option<i32>,
     pub last_activity_at: Option<DateTime<Utc>>,
+    /// Set once a standalone runner has claimed and created this
+    /// workspace's container; `null` for workspaces hosted directly by
+    /// `server`'s own Docker daemon (the default).
+    pub runner_id: Option<String>,
 }
 
 impl From<entity::dev_workspace::Model> for DevWorkspaceObject {
@@ -577,6 +581,7 @@ impl From<entity::dev_workspace::Model> for DevWorkspaceObject {
             created_at: m.created_at,
             auto_stop_minutes: m.auto_stop_minutes,
             last_activity_at: m.last_activity_at,
+            runner_id: m.runner_id,
         }
     }
 }
@@ -712,12 +717,22 @@ impl From<entity::activity_event::Model> for ActivityEventObject {
     }
 }
 
+/// A single code-search hit: one file, in one repository, that matched.
+#[derive(SimpleObject, Clone)]
+pub struct CodeSearchResultObject {
+    pub repository: RepositoryObject,
+    pub path: String,
+    /// An FTS5-generated excerpt around the match, with `[b]...[/b]` markers.
+    pub snippet: String,
+}
+
 /// Result bundle for the basic `search` query, grouping matches by entity kind.
 #[derive(SimpleObject, Clone)]
 pub struct SearchResults {
     pub repositories: Vec<RepositoryObject>,
     pub issues: Vec<IssueObject>,
     pub users: Vec<UserObject>,
+    pub code: Vec<CodeSearchResultObject>,
 }
 
 #[derive(SimpleObject, Clone)]
