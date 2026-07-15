@@ -13,23 +13,27 @@
 //! - `steps[].run` — executed as a shell command inside a Docker container.
 //! - `steps[].uses: actions/checkout@*` — no-op, since the repository
 //!   contents are already materialized into the container's workspace.
+//! - `steps[].uses: docker://image` and `owner/repo[/path]@ref` marketplace
+//!   actions whose `action.yml` declares `runs.using` as `docker`,
+//!   `composite`, or a Node runtime (`node12`/`node16`/`node18`/`node20`)
+//!   — see `marketplace` and `Executor::execute_uses_step`. Composite
+//!   actions may not nest another composite action (one level deep only).
 //!
 //! ## Limitations
 //!
-//! - There is **no GitHub Actions marketplace support**. Any `uses:` step
-//!   other than `actions/checkout` is logged and skipped rather than
-//!   executed — the job continues but that step is a no-op. This means
-//!   workflows relying on actions like `actions/setup-node` or third-party
-//!   actions will not get their expected side effects (e.g. toolchain
-//!   installation); users should replace them with equivalent `run:` steps
-//!   or pre-baked container images (`runs-on: <image>`).
+//! - Any `uses:` value that isn't `actions/checkout`, a `docker://` image,
+//!   or a resolvable `owner/repo[/path]@ref` (or one whose `action.yml`
+//!   declares an unsupported `runs.using`, or a nested composite action) is
+//!   logged and skipped rather than executed — the job continues but that
+//!   step is a no-op.
 //! - `strategy.matrix`, `outputs`, `if:` conditionals, reusable workflows,
-//!   composite actions, and caching are not implemented.
+//!   and caching are not implemented.
 //! - Windows/macOS runners are executed on a Linux Docker image fallback.
 
 use std::collections::HashMap;
 
 pub mod executor;
+pub mod marketplace;
 pub mod secrets;
 pub mod trigger;
 pub mod workflow;
@@ -50,6 +54,9 @@ pub enum ActionsError {
 
     #[error("artifact error: {0}")]
     Artifact(String),
+
+    #[error("marketplace action error: {0}")]
+    Marketplace(String),
 }
 
 /// Scan a map of repository file paths -> file contents for
