@@ -15,10 +15,14 @@ Actions-compatible CI running real Docker jobs, Coder-like containerized dev
 workspaces, GraphQL API, package registry. See `JOURNAL.md` for the full
 build log and honest list of what is and isn't production-hardened.
 
-**Known gaps** (see `JOURNAL.md` for detail): no artifact-of-repo-mirroring for
-existing repos' pre-receive hooks (only newly-created repos get the force-push
-protection hook), no code-search/full-text search (only ILIKE-ish substring
-match), no rename-repo-on-disk.
+**Known gaps** (see `JOURNAL.md` for detail, and `DOC.md` §14 for the current
+full list): GitHub Actions marketplace support covers Docker/composite/JS
+actions but not every toolkit behavior (step outputs, `GITHUB_ENV`, caching);
+standalone-runner-hosted dev workspaces support create/delete/exec but not
+start/stop or live port-proxying; code search only indexes each repo's
+default branch; CI/dev-workspace execution needs a Docker socket, and the
+shipped `docker-compose.yml` bind-mounts the host's own one (a real privilege
+surface) rather than defaulting to a safer rootless engine.
 
 ## Architecture
 
@@ -36,7 +40,7 @@ Rust workspace, one crate per concern:
 | `webhooks` | HMAC-signed webhook dispatch |
 | `graphql-api` | The GraphQL schema (async-graphql) wiring everything together |
 | `server` | axum binary: HTTP router (GraphQL, git smart-HTTP, packages, artifacts), spawns the SSH server, embeds the Hiqlite database node, and runs background loops (mirror sync, workspace auto-stop) |
-| `runner` | **Optional**, standalone poll-based binary. Polls the main `server`'s `/runner/claim` HTTP route for queued CI jobs (`runner_jobs` table) and executes them locally via the same `actions::Executor`/`actions::Workflow` logic the server uses in-process, reporting results back to `/runner/jobs/:id/complete`. The `server` binary keeps running every CI job in-process exactly as before regardless of whether any `runner` is connected — the two paths are additive, not a replacement (see the `// DUAL-PATH:` comments in `crates/server/src/main.rs` and `crates/graphql-api/src/mutation.rs`). Also carries a `dev_env::WorkspaceManager` dependency as a forward-compat stub for eventual dev-workspace-hosting polling (not implemented yet). |
+| `runner` | **Optional**, standalone poll-based binary. Polls the main `server`'s `/runner/claim` HTTP route for queued CI jobs (`runner_jobs` table) and executes them locally via the same `actions::Executor`/`actions::Workflow` logic the server uses in-process, reporting results back to `/runner/jobs/:id/complete`. The `server` binary keeps running every CI job in-process exactly as before regardless of whether any `runner` is connected — the two paths are additive, not a replacement (see the `// DUAL-PATH:` comments in `crates/server/src/main.rs` and `crates/graphql-api/src/mutation.rs`). Also claims and executes `dev_workspace_action` jobs against its own local Docker daemon (`dev_env::WorkspaceManager`), letting a dev workspace be hosted on the runner instead of `server` — create/delete/exec only, see `DOC.md` §7 for the gaps. |
 
 `frontend/` is an independent Nuxt 3 + Vue 3 app for browsing/testing against
 the GraphQL API — not required for production use.

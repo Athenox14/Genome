@@ -16,12 +16,25 @@
 //!   `/runner/*` routes (validated the same way as any other bearer/PAT request).
 //! - `GENOME_RUNNER_ARTIFACTS_DIR` -- local directory for artifact tarballs
 //!   collected by `actions::Executor` (defaults to `./runner-artifacts`).
-//! - `DOCKER_SOCKET_PATH` -- accepted for forward-compatibility. `bollard`'s
-//!   `Docker::connect_with_local_defaults()` (used by both `actions::Executor`
-//!   and `dev_env::WorkspaceManager`) already honors Docker's own standard
-//!   `DOCKER_HOST` env var / platform-default socket resolution; there is no
-//!   separate bollard knob for an arbitrary "socket path" env var today, so
-//!   this variable is currently read but only logged, not wired further.
+//! - `DOCKER_SOCKET_PATH` -- optional. If unset, connects to Docker via
+//!   platform defaults (`DOCKER_HOST` env var, else the usual unix
+//!   socket/named pipe), same as before. If set, connects to that exact
+//!   socket path instead -- e.g. a rootless Podman socket -- so this
+//!   process doesn't need root-equivalent access to the host's main Docker
+//!   daemon. See the "Container isolation" section of the docs.
+//! - `GENOME_RUNNER_ID` -- optional free-form identifier for this runner
+//!   process, reported back on `dev_workspace_action` `create` jobs so
+//!   `dev_workspaces.runner_id` records which runner is hosting a given
+//!   workspace. Defaults to a freshly generated UUID if unset (so it's
+//!   stable for this process's lifetime, but changes across restarts).
+//!
+//! This binary also claims and executes `dev_workspace_action` jobs (see
+//! `dev_workspace_poll`), letting a dev workspace be hosted on this
+//! runner's own Docker daemon instead of `server`'s. Only create/delete/exec
+//! are wired up -- live port-proxying to a runner-hosted workspace isn't
+//! supported yet (no reverse tunnel between runner and server exists), so
+//! `server` rejects `start`/`stop`/proxy requests for one with a clear error
+//! instead of silently trying the wrong Docker daemon.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -57,6 +70,8 @@ struct CiJobPayload {
 struct CompleteRequest {
     status: String,
     logs: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
 }
 
 #[tokio::main]
@@ -72,17 +87,25 @@ async fn main() -> anyhow::Result<()> {
     let artifacts_dir = std::env::var("GENOME_RUNNER_ARTIFACTS_DIR")
         .unwrap_or_else(|_| "./runner-artifacts".to_string());
 
-    if let Ok(socket) = std::env::var("DOCKER_SOCKET_PATH") {
-        tracing::info!(
-            "DOCKER_SOCKET_PATH={socket} accepted for forward-compat; bollard resolves the \
-             Docker socket via its own DOCKER_HOST convention / platform defaults, not this var"
-        );
-    }
+    let docker_socket_path = std::env::var("DOCKER_SOCKET_PATH").ok();
 
-    let executor = actions::Executor::new(std::path::PathBuf::from(&artifacts_dir))?;
+    let (executor, workspace_manager) = match &docker_socket_path {
+        Some(socket) => {
+            tracing::info!("connecting to Docker socket {socket} (from DOCKER_SOCKET_PATH)");
+            (
+                actions::Executor::new_with_socket(std::path::PathBuf::from(&artifacts_dir), socket)?,
+                dev_env::WorkspaceManager::connect_socket(socket)?,
+            )
+        }
+        None => (
+            actions::Executor::new(std::path::PathBuf::from(&artifacts_dir))?,
+            dev_env::WorkspaceManager::connect_local()?,
+        ),
+    };
+    let runner_id = std::env::var("GENOME_RUNNER_ID").unwrap_or_else(|_| Uuid::new_v4().to_string());
     let http = reqwest::Client::new();
 
-    tracing::info!("runner started, polling {server_url} every 5s");
+    tracing::info!("runner started (id={runner_id}), polling {server_url} every 5s");
 
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
@@ -90,7 +113,16 @@ async fn main() -> anyhow::Result<()> {
 
         match claim_job(&http, &server_url, &runner_token).await {
             Ok(Some(job)) => {
-                if let Err(e) = handle_job(&http, &server_url, &runner_token, &executor, job).await
+                if let Err(e) = handle_job(
+                    &http,
+                    &server_url,
+                    &runner_token,
+                    &executor,
+                    &workspace_manager,
+                    &runner_id,
+                    job,
+                )
+                .await
                 {
                     tracing::warn!("failed to handle claimed job: {e}");
                 }
@@ -127,21 +159,20 @@ async fn claim_job(
     Ok(Some(job))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_job(
     http: &reqwest::Client,
     server_url: &str,
     token: &str,
     executor: &actions::Executor,
+    workspace_manager: &dev_env::WorkspaceManager,
+    runner_id: &str,
     job: ClaimedJob,
 ) -> anyhow::Result<()> {
     if job.kind == entity_kind_dev_workspace() {
-        // TODO(future work): full dev-workspace-hosting polling is not
-        // implemented yet. `dev_workspace_poll::poll_dev_workspace_jobs`
-        // exists as a stub proving `dev_env::WorkspaceManager` wiring
-        // compiles; wire it up here once that feature is built out.
-        tracing::warn!("received dev_workspace_action job {}; not yet supported by runner, skipping", job.id);
-        report_complete(http, server_url, token, job.id, "failure", "dev_workspace_action jobs are not yet supported by the standalone runner".to_string()).await?;
-        return Ok(());
+        let (status, logs, result) =
+            dev_workspace_poll::handle_dev_workspace_job(workspace_manager, runner_id, &job.payload).await;
+        return report_complete(http, server_url, token, job.id, status, logs, result).await;
     }
 
     let payload: CiJobPayload = serde_json::from_str(&job.payload)?;
@@ -179,7 +210,7 @@ async fn handle_job(
         }
     };
 
-    report_complete(http, server_url, token, job.id, status, collected_logs).await
+    report_complete(http, server_url, token, job.id, status, collected_logs, None).await
 }
 
 async fn report_complete(
@@ -189,10 +220,12 @@ async fn report_complete(
     job_id: Uuid,
     status: &str,
     logs: String,
+    result: Option<String>,
 ) -> anyhow::Result<()> {
     let body = CompleteRequest {
         status: status.to_string(),
         logs,
+        result,
     };
     let resp = http
         .post(format!("{server_url}/runner/jobs/{job_id}/complete"))
