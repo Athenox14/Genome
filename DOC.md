@@ -191,10 +191,17 @@ file content, not substring `LIKE`).
 ### `repository` nested fields (all resolved on the `RepositoryObject` type)
 
 `ownerLogin`, `issues`, `pullRequests`, `workflowRuns`, `packages`,
-`secretNames`, `branches`, `tree(ref, path)`, `wikiPages`, `wikiPage(page)`,
-`commits(ref, limit)`, `activity(limit)`, `collaborators`, `labels`,
-`milestones`, `projects` (with nested `columns` → `cards` → `issue`),
-`branchProtectionRules`, `webhooks`.
+`secretNames`, `branches`, `tree(ref, path)`, `fileContent(ref, path)` (a
+single file's content — `content` as UTF-8 text plus `contentBase64` always,
+`isBinary`/`size`; returns `null` for a missing path/ref or a file over
+10MiB), `wikiPages`, `wikiPage(page)`, `commits(ref, limit)`,
+`activity(limit)`, `collaborators`, `labels`, `milestones`, `projects` (with
+nested `columns` → `cards` → `issue`), `branchProtectionRules`, `webhooks`.
+
+### `issue` nested fields (all resolved on the `IssueObject` type)
+
+`labels`, `milestone`, `comments` (posted via `commentOnIssue`, oldest
+first).
 
 ### Mutations, grouped
 
