@@ -1,4 +1,5 @@
 use async_graphql::{ComplexObject, Context, SimpleObject};
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use hiqlite::params;
 use uuid::Uuid;
@@ -189,6 +190,40 @@ impl RepositoryObject {
             .list_tree(&self.owner_login, &self.name, &r#ref, &path)
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(entries.into_iter().map(TreeEntryObject::from).collect())
+    }
+
+    /// Reads a single file's content at a given ref. Returns `null` if the
+    /// ref/path doesn't resolve to a regular file. Caps at 10MiB to avoid an
+    /// API client pulling an oversized blob into a single GraphQL response;
+    /// larger files are reported as `null` rather than truncated.
+    async fn file_content(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "ref", default = "\"HEAD\".to_string()")] r#ref: String,
+        path: String,
+    ) -> async_graphql::Result<Option<FileContentObject>> {
+        const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+        let app = ctx.data::<AppContext>()?;
+        let bytes = match app
+            .repo_manager
+            .read_file_at_ref(&self.owner_login, &self.name, &r#ref, &path)
+        {
+            Ok(bytes) if bytes.len() <= MAX_FILE_BYTES => bytes,
+            _ => return Ok(None),
+        };
+        let is_binary = bytes.contains(&0u8);
+        let content = if is_binary {
+            None
+        } else {
+            String::from_utf8(bytes.clone()).ok()
+        };
+        Ok(Some(FileContentObject {
+            path,
+            size: bytes.len() as i64,
+            is_binary,
+            content,
+            content_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        }))
     }
 
     async fn wiki_pages(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<String>> {
@@ -406,6 +441,19 @@ impl IssueObject {
             .into_iter()
             .next();
         Ok(milestone.map(MilestoneObject::from))
+    }
+
+    /// Comments posted on this issue via `commentOnIssue`, oldest first.
+    async fn comments(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<IssueCommentObject>> {
+        let app = ctx.data::<AppContext>()?;
+        let comments = app
+            .db
+            .query_as::<entity::issue_comment::Model, _>(
+                "SELECT * FROM issue_comments WHERE issue_id = ?1 ORDER BY created_at ASC",
+                params!(self.id.to_string()),
+            )
+            .await?;
+        Ok(comments.into_iter().map(IssueCommentObject::from).collect())
     }
 }
 
@@ -631,6 +679,18 @@ impl From<git_core::TreeEntry> for TreeEntryObject {
             oid: e.oid,
         }
     }
+}
+
+/// A single file's content read at a ref, returned by `Repository.fileContent`.
+#[derive(SimpleObject, Clone)]
+pub struct FileContentObject {
+    pub path: String,
+    pub size: i64,
+    pub is_binary: bool,
+    /// UTF-8 text content, or `null` if the file is binary / not valid UTF-8.
+    pub content: Option<String>,
+    /// Base64-encoded raw bytes, always present regardless of `isBinary`.
+    pub content_base64: String,
 }
 
 #[derive(SimpleObject, Clone)]
