@@ -41,7 +41,13 @@ jobs:
 
   docs:
     name: DOC.md schema sync check
+    # Skipped on the push event that the auto-commit step below creates for
+    # main (it's already in sync by construction) — otherwise every commit
+    # from the auto-commit bot would retrigger and re-check itself.
+    if: "!contains(github.event.head_commit.message, '[skip docs-check]')"
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,7 +64,25 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check DOC.md is in sync with the GraphQL schema
+        if: github.event_name != 'push' || github.ref != 'refs/heads/main'
         run: cargo run -p xtask -- gen-docs --check
+
+      - name: Regenerate DOC.md
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cargo run -p xtask -- gen-docs
+
+      - name: Commit DOC.md if it changed
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          if git diff --quiet -- DOC.md; then
+            echo "DOC.md already in sync."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add DOC.md
+          git commit -m "docs: regenerate GraphQL schema reference [skip docs-check]"
+          git push
 
   docker:
     name: Build and push Docker image
