@@ -12,6 +12,7 @@ members = [
     "crates/server",
     "crates/ssh-server",
     "crates/runner",
+    "crates/xtask",
 ]
 
 [workspace.package]

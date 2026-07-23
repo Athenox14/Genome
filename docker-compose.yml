@@ -69,18 +69,3 @@ services:
     volumes:
       - ./data/nora:/data
       - ./config/nora.example.toml:/data/config.toml:ro
-
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    depends_on:
-      - server
-    environment:
-      NUXT_PUBLIC_API_BASE: http://localhost:8000
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
