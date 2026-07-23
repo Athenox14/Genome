@@ -73,11 +73,13 @@ GraphQL mutation/query reference, and known limitations: **see [`DOC.md`](DOC.md
 ```bash
 cargo check --workspace
 cargo test --workspace
+cargo run -p xtask -- gen-docs   # regenerate DOC.md's schema/config/crate tables
 ```
 
 CI (`.github/workflows/docker-publish.yml`) runs the same checks on every
 push/PR, builds and pushes the Docker image to GHCR on pushes to `main` and
-on `v*` tags, and cuts a GitHub release for tags.
+on `v*` tags, cuts a GitHub release for tags, and auto-commits `DOC.md`
+whenever the schema/config drifts on a push to `main`.
 
 ## License
 

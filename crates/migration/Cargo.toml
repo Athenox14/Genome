@@ -1,5 +1,6 @@
 [package]
 name = "migration"
+description = "Hiqlite (embedded, Raft-replicated SQLite) schema migrations"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

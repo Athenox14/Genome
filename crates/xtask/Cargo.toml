@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 async-graphql = { workspace = true }
 graphql-api = { path = "../graphql-api" }
+regex = { workspace = true }
+toml = "0.8"

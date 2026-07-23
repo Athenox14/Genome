@@ -1,5 +1,6 @@
 [package]
 name = "auth"
+description = "JWT issuing/verification, PAT hashing, argon2 password hashing, and the permission model"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

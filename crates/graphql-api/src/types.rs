@@ -178,6 +178,7 @@ impl RepositoryObject {
         Ok(names.into_iter().map(|name| BranchObject { name }).collect())
     }
 
+    /// Lists the git tree at `ref`/`path` (defaults to the repo root at HEAD).
     async fn tree(
         &self,
         ctx: &Context<'_>,

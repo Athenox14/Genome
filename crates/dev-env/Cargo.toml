@@ -1,5 +1,6 @@
 [package]
 name = "dev-env"
+description = "Coder-like containerized dev workspaces (bollard/Docker), auto-stop scheduling, HTTP reverse-proxy to the workspace"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

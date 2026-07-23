@@ -1,5 +1,6 @@
 [package]
 name = "graphql-api"
+description = "The GraphQL schema (async-graphql) wiring every other crate together"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

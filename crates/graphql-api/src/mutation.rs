@@ -330,6 +330,7 @@ pub(crate) async fn load_repo_secrets(
 
 #[Object]
 impl MutationRoot {
+    /// Creates a new user account with an argon2-hashed password.
     async fn register(
         &self,
         ctx: &Context<'_>,
@@ -427,6 +428,7 @@ impl MutationRoot {
         Ok(affected > 0)
     }
 
+    /// Verifies username/password and returns a signed JWT plus the user.
     async fn login(
         &self,
         ctx: &Context<'_>,
@@ -567,6 +569,7 @@ impl MutationRoot {
         Ok(count)
     }
 
+    /// Creates a repository owned by the current user, plus its bare git repo on disk.
     async fn create_repository(
         &self,
         ctx: &Context<'_>,
@@ -639,6 +642,7 @@ impl MutationRoot {
         Ok(RepositoryObject::from_model(&app.db, repo).await)
     }
 
+    /// Deletes a repository and its on-disk bare repo/wiki. Requires Admin permission.
     async fn delete_repository(&self, ctx: &Context<'_>, repo_id: Uuid) -> async_graphql::Result<bool> {
         let app = ctx.data::<AppContext>()?;
         let req = ctx.data::<RequestContext>()?;
@@ -879,6 +883,7 @@ impl MutationRoot {
         Ok(RepositoryObject::from_model(&app.db, repo).await)
     }
 
+    /// Opens a new issue on a repository. Requires at least Read permission.
     async fn create_issue(
         &self,
         ctx: &Context<'_>,
@@ -1052,6 +1057,7 @@ impl MutationRoot {
         Ok(IssueObject::from(issue))
     }
 
+    /// Posts a comment on an issue.
     async fn comment_on_issue(
         &self,
         ctx: &Context<'_>,
@@ -1118,6 +1124,7 @@ impl MutationRoot {
         Ok(IssueCommentObject::from(comment))
     }
 
+    /// Opens a pull request proposing to merge `source_branch` into `target_branch`.
     async fn create_pull_request(
         &self,
         ctx: &Context<'_>,
@@ -1654,6 +1661,7 @@ impl MutationRoot {
         Ok(PrReviewCommentObject::from(comment))
     }
 
+    /// Creates an organization, with the current user as its first (owner) member.
     async fn create_organization(
         &self,
         ctx: &Context<'_>,
@@ -1841,6 +1849,7 @@ impl MutationRoot {
         Ok(true)
     }
 
+    /// Grants a user a permission level (`read`/`write`/`admin`) on a repository.
     async fn add_collaborator(
         &self,
         ctx: &Context<'_>,
@@ -2239,6 +2248,7 @@ impl MutationRoot {
         Ok(DevWorkspaceObject::from(workspace))
     }
 
+    /// Starts a stopped dev workspace's container.
     async fn start_dev_workspace(&self, ctx: &Context<'_>, workspace_id: Uuid) -> async_graphql::Result<DevWorkspaceObject> {
         let app = ctx.data::<AppContext>()?;
         let req = ctx.data::<RequestContext>()?;
@@ -2283,6 +2293,7 @@ impl MutationRoot {
         Ok(DevWorkspaceObject::from(workspace))
     }
 
+    /// Stops a running dev workspace's container (keeps its filesystem).
     async fn stop_dev_workspace(&self, ctx: &Context<'_>, workspace_id: Uuid) -> async_graphql::Result<DevWorkspaceObject> {
         let app = ctx.data::<AppContext>()?;
         let req = ctx.data::<RequestContext>()?;
@@ -2327,6 +2338,7 @@ impl MutationRoot {
         Ok(DevWorkspaceObject::from(workspace))
     }
 
+    /// Deletes a dev workspace and its container/volumes.
     async fn delete_dev_workspace(&self, ctx: &Context<'_>, workspace_id: Uuid) -> async_graphql::Result<bool> {
         let app = ctx.data::<AppContext>()?;
         let req = ctx.data::<RequestContext>()?;
@@ -2375,6 +2387,7 @@ impl MutationRoot {
 
     // ---- Labels ----
 
+    /// Creates a label (name + hex color) for a repository, usable on issues.
     async fn create_label(
         &self,
         ctx: &Context<'_>,
@@ -2409,6 +2422,7 @@ impl MutationRoot {
         Ok(LabelObject::from(label))
     }
 
+    /// Attaches an existing label to an issue.
     async fn add_label_to_issue(
         &self,
         ctx: &Context<'_>,
@@ -2464,6 +2478,7 @@ impl MutationRoot {
         Ok(IssueObject::from(issue))
     }
 
+    /// Detaches a label from an issue.
     async fn remove_label_from_issue(
         &self,
         ctx: &Context<'_>,
@@ -2499,6 +2514,7 @@ impl MutationRoot {
 
     // ---- Milestones ----
 
+    /// Creates a milestone (optional due date) for a repository.
     async fn create_milestone(
         &self,
         ctx: &Context<'_>,
@@ -2547,6 +2563,7 @@ impl MutationRoot {
         Ok(MilestoneObject::from(milestone))
     }
 
+    /// Sets (or clears, with `null`) an issue's milestone.
     async fn set_issue_milestone(
         &self,
         ctx: &Context<'_>,
@@ -2598,6 +2615,7 @@ impl MutationRoot {
 
     // ---- Projects ----
 
+    /// Creates a Kanban project (board) for a repository.
     async fn create_project(
         &self,
         ctx: &Context<'_>,
@@ -2632,6 +2650,7 @@ impl MutationRoot {
         Ok(ProjectObject::from(project))
     }
 
+    /// Adds a column (e.g. "To do"/"Done") to a project, at the given position.
     async fn add_project_column(
         &self,
         ctx: &Context<'_>,
@@ -2673,6 +2692,7 @@ impl MutationRoot {
         Ok(ProjectColumnObject::from(column))
     }
 
+    /// Adds an issue as a card in a project column, at the given position.
     async fn add_card_to_column(
         &self,
         ctx: &Context<'_>,

@@ -1,5 +1,6 @@
 [package]
 name = "server"
+description = "axum binary: HTTP router (GraphQL, git smart-HTTP, packages, artifacts, OAuth-free bootstrap), embeds the Hiqlite database node, spawns the SSH server, runs background loops (mirror sync, workspace auto-stop)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

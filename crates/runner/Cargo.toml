@@ -1,5 +1,6 @@
 [package]
 name = "runner"
+description = "Optional standalone binary: polls the main server's /runner/claim route for queued CI/dev-workspace jobs and executes them locally, for scaling job execution to separate machines/pods"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

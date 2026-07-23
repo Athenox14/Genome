@@ -1,5 +1,6 @@
 [package]
 name = "ssh-server"
+description = "git-over-SSH (russh), pubkey auth against registered SSH keys"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
