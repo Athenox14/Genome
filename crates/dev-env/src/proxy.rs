@@ -46,8 +46,17 @@ pub async fn proxy_to_workspace(
     let status =
         StatusCode::from_u16(upstream_response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
+    // `transfer-encoding`/`content-length` describe upstream's original framing,
+    // but the body below is fully buffered into a single `Bytes` chunk -- axum
+    // recomputes the real content-length itself. Forwarding the stale header
+    // (e.g. `chunked`) alongside a non-chunked body is a framing mismatch that
+    // some HTTP clients (observed with .NET's HttpWebRequest) treat as a reset
+    // connection rather than a well-formed response.
     let mut response_headers = HeaderMap::new();
     for (name, value) in upstream_response.headers().iter() {
+        if name == reqwest::header::TRANSFER_ENCODING || name == reqwest::header::CONTENT_LENGTH {
+            continue;
+        }
         if let Ok(n) = axum::http::HeaderName::from_bytes(name.as_str().as_bytes()) {
             if let Ok(v) = axum::http::HeaderValue::from_bytes(value.as_bytes()) {
                 response_headers.insert(n, v);
