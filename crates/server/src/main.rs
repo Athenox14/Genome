@@ -1375,10 +1375,15 @@ async fn sync_repo_mirrors(app_ctx: AppContext) {
                 }
             };
 
+            // Refspecs explicites : sans elles, `git fetch <url>` dans un dépôt bare ne met à jour que
+            // FETCH_HEAD, jamais les branches ni les tags — le « miroir » ne reflétait rien. `+` force la
+            // mise à jour (réécritures d'historique en amont) et `--prune` retire ce qui a disparu en amont.
             let result = tokio::process::Command::new("git")
                 .arg("fetch")
                 .arg("--prune")
                 .arg(&mirror.remote_url)
+                .arg("+refs/heads/*:refs/heads/*")
+                .arg("+refs/tags/*:refs/tags/*")
                 .current_dir(&repo_path)
                 .output()
                 .await;
