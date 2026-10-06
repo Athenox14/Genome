@@ -12,7 +12,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
 use hiqlite::params;
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_governor::{governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -180,9 +180,14 @@ async fn main() -> anyhow::Result<()> {
     // Per-IP token-bucket rate limiting via `tower_governor`: replenishes one
     // request allowance every 500ms (2/sec sustained, matching the previous
     // fixed-window limiter's ~120 req/min average) with a burst allowance of
-    // 120 requests, keyed by peer IP by default. Excess requests get a 429.
+    // 120 requests. Excess requests get a 429.
+    //
+    // Keyed by the CLIENT IP (`X-Forwarded-For` / `X-Real-IP` / `Forwarded`, falling back to the peer IP), not by
+    // the peer IP alone: behind the ingress every request has the ingress pod as its peer, so all clients (users,
+    // security scanner, uptime probes) shared ONE bucket and a scan starved the health check (429 on /health).
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
+            .key_extractor(SmartIpKeyExtractor)
             .per_millisecond(500)
             .burst_size(120)
             .finish()
@@ -205,7 +210,6 @@ async fn main() -> anyhow::Result<()> {
             "/graphql",
             get(graphql_playground).post(graphql_post_handler),
         )
-        .route("/health", get(health_handler))
         .route(
             "/:owner/:repo/info/refs",
             get(info_refs_handler),
@@ -242,6 +246,9 @@ async fn main() -> anyhow::Result<()> {
         .layer(GovernorLayer {
             config: governor_conf,
         })
+        // Added AFTER the rate-limit layer so health probes are never throttled (a layer only wraps the routes
+        // declared before it). Trace and CORS below still apply to it.
+        .route("/health", get(health_handler))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state);
